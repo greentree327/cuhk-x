@@ -26,10 +26,25 @@ from src.config import Config
 from src.data_bootstrap import ensure_dataset_available
 
 
+def _env_str(name, default):
+    """os.environ.get(name, default), but also falls back to default when
+    the variable is set to an empty string. IPython's `%env VAR=` sets VAR
+    to "" rather than actually unsetting it, so treating "" as "not set"
+    here is what makes `%env CUHKX_FOO=` behave like a real reset."""
+    val = os.environ.get(name, "")
+    return val if val else default
+
+
+def _env_int(name, default):
+    """Same empty-string-means-unset handling as _env_str, parsed as int."""
+    val = _env_str(name, "")
+    return int(val) if val else default
+
+
 # Overridable so checkpoints/logs can be redirected to persistent storage
 # (e.g. a Google Drive mount in Colab) without moving the code itself there.
 # Defaults to "output" (unchanged local behavior) when unset.
-OUTPUT_ROOT = Path(os.environ.get("CUHKX_OUTPUT_ROOT", "output"))
+OUTPUT_ROOT = Path(_env_str("CUHKX_OUTPUT_ROOT", "output"))
 LOG_PATH = OUTPUT_ROOT / "run.log"
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -120,10 +135,13 @@ def main():
     #
     # epochs/n_folds are overridable via env vars so a quick timing/sanity
     # run (e.g. CUHKX_EPOCHS=10 CUHKX_N_FOLDS=1) doesn't require editing
-    # this file and remembering to revert it before the real run.
+    # this file and remembering to revert it before the real run. Treats an
+    # empty string the same as unset — IPython's `%env VAR=` sets VAR to ""
+    # rather than actually removing it, and os.environ.get()'s default only
+    # applies when the key is absent, not when it's present-but-empty.
     base = dict(
-        epochs=int(os.environ.get("CUHKX_EPOCHS", 60)),
-        n_folds=int(os.environ.get("CUHKX_N_FOLDS", 5)),
+        epochs=_env_int("CUHKX_EPOCHS", 60),
+        n_folds=_env_int("CUHKX_N_FOLDS", 5),
         batch_size=16, num_workers=2, mixed_precision=True,
     )
 
@@ -147,7 +165,7 @@ def main():
     # Which configs to run is also overridable, so a calibration run can
     # target just one (e.g. CUHKX_CONFIGS=minimal) instead of all three.
     all_configs = [("minimal", c1), ("baseline", c2), ("synthesized", c3)]
-    requested = os.environ.get("CUHKX_CONFIGS")
+    requested = _env_str("CUHKX_CONFIGS", "")
     if requested:
         wanted = {name.strip() for name in requested.split(",")}
         all_configs = [(label, cfg) for label, cfg in all_configs if label in wanted]
