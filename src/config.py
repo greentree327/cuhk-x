@@ -120,7 +120,18 @@ class Config:
     lr_min: float = 1e-6
     warmup_epochs: int = 5
     label_smoothing: float = 0.1
-    ema_decay: float = 0.999
+    # EMA time constant is 1/(1-decay) steps. 0.999 (~1000 steps) was ported
+    # from CMI, whose dataset had far more steps/epoch than this one's
+    # ~37-39 (599-622 train clips / batch_size 16). At 0.999, validation
+    # (always evaluated on EMA weights) needs ~18-27 epochs just to start
+    # reflecting real progress — confirmed live: train acc/loss improved
+    # normally epoch-to-epoch while val stayed flat, because EMA hadn't
+    # caught up yet. That's within early_stop_patience=20, so early
+    # stopping could trigger before EMA-based validation reflects the
+    # model at all. 0.98 (~50-step / ~1.3-epoch time constant) still
+    # smooths noisy updates but converges fast enough to be meaningful
+    # within a handful of epochs.
+    ema_decay: float = 0.98
     grad_clip_norm: float = 1.0
     mixed_precision: bool = True
 
