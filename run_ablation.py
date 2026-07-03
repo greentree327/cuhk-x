@@ -117,7 +117,15 @@ def main():
     # VRAM and only surviving via WDDM's memory oversubscription — it would
     # eventually OOM over a full 60-epoch run as fragmentation grows).
     # batch_size=16 leaves a safe margin (~5.3GB peak reserved).
-    base = dict(epochs=60, n_folds=5, batch_size=16, num_workers=2, mixed_precision=True)
+    #
+    # epochs/n_folds are overridable via env vars so a quick timing/sanity
+    # run (e.g. CUHKX_EPOCHS=10 CUHKX_N_FOLDS=1) doesn't require editing
+    # this file and remembering to revert it before the real run.
+    base = dict(
+        epochs=int(os.environ.get("CUHKX_EPOCHS", 60)),
+        n_folds=int(os.environ.get("CUHKX_N_FOLDS", 5)),
+        batch_size=16, num_workers=2, mixed_precision=True,
+    )
 
     c1 = Config()
     c1.output_dir = OUTPUT_ROOT / "minimal"
@@ -136,9 +144,17 @@ def main():
     c3.output_dir = OUTPUT_ROOT / "synthesized"
     for k, v in base.items(): setattr(c3, k, v)
 
+    # Which configs to run is also overridable, so a calibration run can
+    # target just one (e.g. CUHKX_CONFIGS=minimal) instead of all three.
+    all_configs = [("minimal", c1), ("baseline", c2), ("synthesized", c3)]
+    requested = os.environ.get("CUHKX_CONFIGS")
+    if requested:
+        wanted = {name.strip() for name in requested.split(",")}
+        all_configs = [(label, cfg) for label, cfg in all_configs if label in wanted]
+
     results = {}
     t_total = time.time()
-    for label, cfg in [("minimal", c1), ("baseline", c2), ("synthesized", c3)]:
+    for label, cfg in all_configs:
         try:
             results[label] = run_config(label, cfg)
         except Exception as e:
