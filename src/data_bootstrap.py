@@ -17,11 +17,18 @@ this. Every step is auto-discovered at runtime and logged, so a mismatch
 surfaces as a clear diagnostic instead of a silent wrong path. If a fresh
 Colab run hits an error here, the printed diagnostics (repo file listing,
 extracted top-level folders) are what to paste back for a fix.
+
+The training archive ships as a split zip (base.zip + base.z01, z02, ...).
+Rather than physically reassembling that into one merged file — which
+needs the original parts AND the merged copy on disk at once, roughly 2x
+the archive's size — _ChainedZipParts presents the parts as one continuous
+seekable stream, so zipfile can read straight across the split boundaries
+without ever materializing a merged copy.
 """
+import io
 import os
 import re
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -92,27 +99,30 @@ def ensure_dataset_available(config, raw_dir=None):
           f"{ {k: [p.name for p in v] for k, v in zip_groups.items()} }")
 
     # Process smallest archive group(s) first so their disk usage is freed
-    # before committing to the largest group's reassemble+extract peak
-    # (zip + its extracted output coexisting is the single biggest moment
-    # of disk pressure — better to hit it with nothing else outstanding).
+    # before committing to the largest group's extraction peak (archive
+    # parts + extracted output coexisting is the single biggest moment of
+    # disk pressure — better to hit it with nothing else outstanding).
     ordered_groups = sorted(
         zip_groups.items(),
         key=lambda kv: sum(p.stat().st_size for p in kv[1]),
     )
 
     for base_name, parts in ordered_groups:
-        full_zip = _reassemble_if_split(raw_dir, base_name, parts)
+        archive = _open_archive(parts)
         extract_scratch = raw_dir / f"_extract_{base_name}"
         extract_scratch.mkdir(exist_ok=True)
-        print(f"[data_bootstrap] Extracting {full_zip.name} -> {extract_scratch}")
-        _extract_zip(full_zip, extract_scratch)
+        print(f"[data_bootstrap] Extracting {base_name} "
+              f"({len(parts)} part(s)) -> {extract_scratch}")
+        _extract_zip(archive, extract_scratch)
+        if hasattr(archive, "close"):
+            archive.close()
 
-        # Free the archive immediately after extraction — a ~40GB zip sitting
-        # next to its own ~40GB extracted output is the other half of the
-        # disk-bloat problem (the first half being the split parts, already
-        # freed in _reassemble_if_split).
-        full_zip.unlink()
-        print(f"[data_bootstrap] Freed {full_zip.name} after extraction")
+        # Free the archive parts immediately after extraction — this is the
+        # only copy of this data other than the extracted output, so there's
+        # no reason to keep it once extraction succeeds.
+        for part in parts:
+            part.unlink()
+        print(f"[data_bootstrap] Freed {len(parts)} archive file(s) for {base_name}")
 
         _place_extracted(extract_scratch, config)
 
@@ -152,24 +162,6 @@ def _download_repo(raw_dir, token):
     print(f"[data_bootstrap] Downloaded {len(listing)} files: {listing}")
 
 
-def _ensure_zip_cli():
-    """Make sure the `zip` CLI is available (needed to reassemble split
-    archives exactly the way the dataset's own instructions specify:
-    `zip -s 0 base.zip --out full.zip`)."""
-    if shutil.which("zip"):
-        return
-    print("[data_bootstrap] 'zip' CLI not found, attempting `apt-get install "
-          "zip` (Colab/Debian only)...")
-    try:
-        subprocess.run(["apt-get", "install", "-y", "-qq", "zip"], check=True)
-    except Exception as e:
-        raise RuntimeError(
-            "`zip` CLI is required to reassemble the split archive and could "
-            f"not be installed automatically ({e}). Install it manually "
-            "(e.g. `apt-get install zip` in Colab) and re-run."
-        )
-
-
 def _find_zip_groups(raw_dir):
     """Group downloaded files by archive base name.
 
@@ -193,48 +185,117 @@ def _find_zip_groups(raw_dir):
 
     for base, parts in groups.items():
         # Split volumes (.z01, .z02, ...) sort before the main .zip, which
-        # must be concatenated last (it holds the central directory record).
+        # must come last in the concatenated stream (it holds the central
+        # directory record, which a zip reader looks for at the very end).
         parts.sort(key=lambda p: (p.suffix.lower() == ".zip", p.name))
     return groups
 
 
-def _reassemble_if_split(raw_dir, base_name, parts):
-    """Reassemble a split archive into one file, or return it unchanged.
-
-    Uses the `zip -s 0` CLI (matches the dataset's documented instructions)
-    rather than a hand-rolled binary concatenation, since a subtle mistake
-    in re-implementing the split-zip format would corrupt the archive.
-    """
+def _open_archive(parts):
+    """Return something zipfile.ZipFile can open directly: the lone Path if
+    there's only one part, or a _ChainedZipParts stream if the archive is
+    split across multiple volumes."""
     if len(parts) == 1:
         return parts[0]
-
-    _ensure_zip_cli()
-    main_zip = next(p for p in parts if p.suffix.lower() == ".zip")
-    full_zip = raw_dir / f"{base_name}_full.zip"
-    if full_zip.exists():
-        print(f"[data_bootstrap] {full_zip.name} already assembled, skipping.")
-        return full_zip
-
-    print(f"[data_bootstrap] Reassembling {len(parts)} volumes for "
-          f"{base_name} via `zip -s 0` ...")
-    subprocess.run(
-        ["zip", "-s", "0", str(main_zip), "--out", str(full_zip)],
-        check=True, cwd=str(raw_dir),
-    )
-
-    # Free the split volumes immediately — with a ~40GB archive, keeping
-    # both the parts and the reassembled copy around at once is exactly
-    # what fills a Colab disk (parts + full_zip + extracted output would
-    # otherwise all coexist).
-    for part in parts:
-        part.unlink()
-    print(f"[data_bootstrap] Freed {len(parts)} split volumes after reassembly")
-    return full_zip
+    return _ChainedZipParts(parts)
 
 
-def _extract_zip(zip_path, dest_dir):
+class _ChainedZipParts(io.RawIOBase):
+    """Read-only, seekable, file-like view over multiple files concatenated
+    in order — the read side of Info-ZIP's split-archive format, without
+    physically merging the parts into a new file on disk.
+
+    Subclasses io.RawIOBase (rather than duck-typing read/seek/tell alone)
+    because zipfile's internals also probe .seekable()/.readable() — a
+    plain object without those raises AttributeError deep inside zipfile.
+    RawIOBase supplies sensible defaults for the rest of the file protocol.
+    """
+
+    def __init__(self, parts):
+        super().__init__()
+        self._parts = parts
+        self._sizes = [p.stat().st_size for p in parts]
+        self._offsets = []
+        total = 0
+        for size in self._sizes:
+            self._offsets.append(total)
+            total += size
+        self._total_size = total
+        self._pos = 0
+        self._fh = None
+        self._fh_idx = None
+
+    def _part_index_for(self, pos):
+        for i in range(len(self._parts) - 1, -1, -1):
+            if pos >= self._offsets[i]:
+                return i
+        return 0
+
+    def _ensure_open(self, idx):
+        if self._fh_idx != idx:
+            if self._fh is not None:
+                self._fh.close()
+            self._fh = open(self._parts[idx], "rb")
+            self._fh_idx = idx
+
+    def seekable(self):
+        return True
+
+    def readable(self):
+        return True
+
+    def writable(self):
+        return False
+
+    def seek(self, offset, whence=0):
+        if whence == 0:
+            self._pos = offset
+        elif whence == 1:
+            self._pos += offset
+        elif whence == 2:
+            self._pos = self._total_size + offset
+        else:
+            raise ValueError(f"invalid whence: {whence}")
+        return self._pos
+
+    def tell(self):
+        return self._pos
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = self._total_size - self._pos
+
+        chunks = []
+        remaining = size
+        pos = self._pos
+        while remaining > 0 and pos < self._total_size:
+            idx = self._part_index_for(pos)
+            self._ensure_open(idx)
+            part_offset = pos - self._offsets[idx]
+            self._fh.seek(part_offset)
+            to_read = min(remaining, self._sizes[idx] - part_offset)
+            chunk = self._fh.read(to_read)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            pos += len(chunk)
+            remaining -= len(chunk)
+
+        self._pos = pos
+        return b"".join(chunks)
+
+    def close(self):
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+            self._fh_idx = None
+        super().close()
+
+
+def _extract_zip(archive, dest_dir):
+    """archive: a Path, or a file-like object (_ChainedZipParts)."""
     import zipfile
-    with zipfile.ZipFile(zip_path, "r") as zf:
+    with zipfile.ZipFile(archive, "r") as zf:
         zf.extractall(dest_dir)
 
 
@@ -242,11 +303,23 @@ def _place_extracted(extract_scratch, config):
     """Find the modality-folder root (or SM_* clip root) inside whatever was
     just extracted, and move it to the exact path config.py expects.
 
-    Searches breadth-first up to MAX_WALK_DEPTH so it works whether the zip's
+    Searches depth-first up to MAX_WALK_DEPTH so it works whether the zip's
     internal layout is `data/<modality>/...` or has extra wrapper folders.
+
+    Each individual test clip folder (SM_test_XXXX) *also* has modality-named
+    children (its own IR/Depth_Color/... subfolders) — structurally
+    indistinguishable from the aggregate train root by child names alone.
+    The train predicate below requires >=2 modality matches (a lone clip
+    folder inside a train-shaped tree is implausible) AND excludes any
+    candidate directory whose own name starts with "SM_" (which a genuine
+    train root, sitting above all actions/users/trials, never does).
     """
     train_root = _find_dir_with_children(
-        extract_scratch, lambda names: any(n in EXPECTED_MODALITIES for n in names)
+        extract_scratch,
+        lambda d, names: (
+            not d.name.startswith("SM_")
+            and sum(n in EXPECTED_MODALITIES for n in names) >= 2
+        ),
     )
     if train_root is not None and not config.train_data.exists():
         print(f"[data_bootstrap] Found training data root at {train_root}, "
@@ -255,7 +328,7 @@ def _place_extracted(extract_scratch, config):
         shutil.move(str(train_root), str(config.train_data))
 
     test_root = _find_dir_with_children(
-        extract_scratch, lambda names: sum(n.startswith("SM_") for n in names) > 3
+        extract_scratch, lambda d, names: sum(n.startswith("SM_") for n in names) > 3
     )
     if test_root is not None and not config.test_data.exists():
         print(f"[data_bootstrap] Found test data root at {test_root}, "
@@ -270,8 +343,8 @@ def _place_extracted(extract_scratch, config):
 
 
 def _find_dir_with_children(root, predicate, depth=0):
-    """BFS for the first directory (at or under root) whose child names
-    satisfy predicate(names)."""
+    """Depth-first search for the first directory (at or under root) whose
+    own path and child names satisfy predicate(dir_path, child_names)."""
     if depth > MAX_WALK_DEPTH:
         return None
     try:
@@ -280,7 +353,7 @@ def _find_dir_with_children(root, predicate, depth=0):
         return None
 
     child_names = [c.name for c in children if c.is_dir()]
-    if predicate(child_names):
+    if predicate(root, child_names):
         return root
 
     for child in children:
