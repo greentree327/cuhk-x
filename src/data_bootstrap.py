@@ -25,11 +25,17 @@ hard-rejects any archive with that flag set (BadZipFile: "zipfiles that
 span multiple disks are not supported"), regardless of whether the bytes
 are read from one physical file or several. There is no way to satisfy
 zipfile without actually clearing that metadata, which is what the
-documented `zip -s 0 --out` reassembly does — so extraction here first
-tries a cheaper path (unzip's own split-archive support, if the installed
-build has it) and only falls back to physical reassembly (which does need
-~2x the archive's size in free disk space during that one step) if that
-doesn't work.
+documented `zip -s 0 --out` reassembly does.
+
+An earlier version of this module tried a cheaper path first (unzip
+reading directly across the split volumes with no merge step), but this
+was confirmed against the real dataset to desync partway through and
+silently produce garbage for every file after that point ("bad zipfile
+offset" errors starting mid-archive) rather than a clean failure — not
+safe to attempt even as a best-effort try. Reassembly via `zip -s 0` is
+always used for multi-part archives; it does need ~2x the archive's size
+in free disk space for that one step, which is unavoidable for a correct
+multi-volume merge.
 """
 import os
 import re
@@ -41,7 +47,6 @@ from pathlib import Path
 REPO_ID = "Kevin-Pal/CUHK-X_Small_Model_Track"
 EXPECTED_MODALITIES = {"Depth_Color", "IR", "Thermal", "IMU", "Radar", "Skeleton"}
 MAX_WALK_DEPTH = 6  # upper-bound guard for the directory auto-detection scan
-UNZIP_DIRECT_TIMEOUT_S = 1800  # generous cap in case a real extraction just needs time
 
 
 def is_dataset_ready(config):
@@ -197,24 +202,21 @@ def _find_zip_groups(raw_dir):
 def _extract_multi_part(parts, base_name, raw_dir, dest_dir):
     """Extract a split archive (base.zip + base.z01, z02, ...) into dest_dir.
 
-    Tries the cheap path first (unzip reading directly across the split
-    volumes, no merged copy ever created) and only falls back to physically
-    reassembling the archive if that doesn't work — the fallback needs the
-    original parts AND the merged copy on disk simultaneously (~2x the
-    archive's size), which the cheap path avoids entirely when it works.
+    Confirmed against the real dataset: unzip reading directly across split
+    volumes (no separate merge step) desyncs partway through and silently
+    produces garbage for every file after that point ("bad zipfile offset"
+    errors starting mid-archive) — not a safe thing to attempt even as a
+    best-effort first try, since a corrupted-but-"successful"-looking
+    extraction is worse than a clean failure. Always physically reassembles
+    via the documented `zip -s 0` method, which does need ~2x the archive's
+    size in free disk space for this one step — unavoidable for a correct
+    multi-volume merge.
     """
     main_zip = next(p for p in parts if p.suffix.lower() == ".zip")
 
-    if shutil.which("unzip") and _try_direct_unzip(main_zip, raw_dir, dest_dir):
-        print(f"[data_bootstrap] {base_name}: unzip read directly across "
-              f"split volumes, no reassembly needed")
-        for part in parts:
-            part.unlink()
-        return
-
-    print(f"[data_bootstrap] {base_name}: direct split-read didn't work, "
-          f"falling back to `zip -s 0` reassembly (needs ~2x this archive's "
-          f"size in free disk space for this one step)...")
+    print(f"[data_bootstrap] {base_name}: reassembling via `zip -s 0` "
+          f"(needs ~2x this archive's size in free disk space for this "
+          f"one step)...")
     _ensure_zip_cli()
     full_zip = raw_dir / f"{base_name}_full.zip"
     subprocess.run(
@@ -225,36 +227,6 @@ def _extract_multi_part(parts, base_name, raw_dir, dest_dir):
         part.unlink()
     _extract_zip(full_zip, dest_dir)
     full_zip.unlink()
-
-
-def _try_direct_unzip(main_zip, raw_dir, dest_dir):
-    """Attempt to extract a split archive directly via the unzip CLI without
-    a separate reassembly step. Returns True on success, False on any
-    failure (leaving dest_dir cleaned up either way, so the caller can
-    safely fall back to reassembly).
-
-    stdin is closed rather than left inherited: some unzip builds prompt
-    interactively ("insert disk 2") for a split archive they can't read
-    automatically, and a closed stdin makes that fail fast instead of
-    hanging indefinitely.
-    """
-    try:
-        result = subprocess.run(
-            ["unzip", "-q", str(main_zip), "-d", str(dest_dir)],
-            cwd=str(raw_dir), stdin=subprocess.DEVNULL,
-            timeout=UNZIP_DIRECT_TIMEOUT_S,
-        )
-    except subprocess.TimeoutExpired:
-        result = None
-
-    succeeded = result is not None and result.returncode == 0 and any(dest_dir.iterdir())
-    if not succeeded:
-        for child in dest_dir.iterdir():
-            if child.is_dir():
-                shutil.rmtree(child, ignore_errors=True)
-            else:
-                child.unlink()
-    return succeeded
 
 
 def _ensure_zip_cli():
