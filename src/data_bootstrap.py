@@ -19,22 +19,29 @@ Colab run hits an error here, the printed diagnostics (repo file listing,
 extracted top-level folders) are what to paste back for a fix.
 
 The training archive ships as a split zip (base.zip + base.z01, z02, ...).
-Rather than physically reassembling that into one merged file — which
-needs the original parts AND the merged copy on disk at once, roughly 2x
-the archive's size — _ChainedZipParts presents the parts as one continuous
-seekable stream, so zipfile can read straight across the split boundaries
-without ever materializing a merged copy.
+A genuine Info-ZIP split archive's ZIP64 locator record has "disk number"
+fields baked into its bytes declaring it multi-volume — Python's zipfile
+hard-rejects any archive with that flag set (BadZipFile: "zipfiles that
+span multiple disks are not supported"), regardless of whether the bytes
+are read from one physical file or several. There is no way to satisfy
+zipfile without actually clearing that metadata, which is what the
+documented `zip -s 0 --out` reassembly does — so extraction here first
+tries a cheaper path (unzip's own split-archive support, if the installed
+build has it) and only falls back to physical reassembly (which does need
+~2x the archive's size in free disk space during that one step) if that
+doesn't work.
 """
-import io
 import os
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 REPO_ID = "Kevin-Pal/CUHK-X_Small_Model_Track"
 EXPECTED_MODALITIES = {"Depth_Color", "IR", "Thermal", "IMU", "Radar", "Skeleton"}
 MAX_WALK_DEPTH = 6  # upper-bound guard for the directory auto-detection scan
+UNZIP_DIRECT_TIMEOUT_S = 1800  # generous cap in case a real extraction just needs time
 
 
 def is_dataset_ready(config):
@@ -108,21 +115,17 @@ def ensure_dataset_available(config, raw_dir=None):
     )
 
     for base_name, parts in ordered_groups:
-        archive = _open_archive(parts)
         extract_scratch = raw_dir / f"_extract_{base_name}"
         extract_scratch.mkdir(exist_ok=True)
         print(f"[data_bootstrap] Extracting {base_name} "
               f"({len(parts)} part(s)) -> {extract_scratch}")
-        _extract_zip(archive, extract_scratch)
-        if hasattr(archive, "close"):
-            archive.close()
 
-        # Free the archive parts immediately after extraction — this is the
-        # only copy of this data other than the extracted output, so there's
-        # no reason to keep it once extraction succeeds.
-        for part in parts:
-            part.unlink()
-        print(f"[data_bootstrap] Freed {len(parts)} archive file(s) for {base_name}")
+        if len(parts) == 1:
+            _extract_zip(parts[0], extract_scratch)
+            parts[0].unlink()
+        else:
+            _extract_multi_part(parts, base_name, raw_dir, extract_scratch)
+        print(f"[data_bootstrap] Freed archive file(s) for {base_name}")
 
         _place_extracted(extract_scratch, config)
 
@@ -191,111 +194,90 @@ def _find_zip_groups(raw_dir):
     return groups
 
 
-def _open_archive(parts):
-    """Return something zipfile.ZipFile can open directly: the lone Path if
-    there's only one part, or a _ChainedZipParts stream if the archive is
-    split across multiple volumes."""
-    if len(parts) == 1:
-        return parts[0]
-    return _ChainedZipParts(parts)
+def _extract_multi_part(parts, base_name, raw_dir, dest_dir):
+    """Extract a split archive (base.zip + base.z01, z02, ...) into dest_dir.
 
-
-class _ChainedZipParts(io.RawIOBase):
-    """Read-only, seekable, file-like view over multiple files concatenated
-    in order — the read side of Info-ZIP's split-archive format, without
-    physically merging the parts into a new file on disk.
-
-    Subclasses io.RawIOBase (rather than duck-typing read/seek/tell alone)
-    because zipfile's internals also probe .seekable()/.readable() — a
-    plain object without those raises AttributeError deep inside zipfile.
-    RawIOBase supplies sensible defaults for the rest of the file protocol.
+    Tries the cheap path first (unzip reading directly across the split
+    volumes, no merged copy ever created) and only falls back to physically
+    reassembling the archive if that doesn't work — the fallback needs the
+    original parts AND the merged copy on disk simultaneously (~2x the
+    archive's size), which the cheap path avoids entirely when it works.
     """
+    main_zip = next(p for p in parts if p.suffix.lower() == ".zip")
 
-    def __init__(self, parts):
-        super().__init__()
-        self._parts = parts
-        self._sizes = [p.stat().st_size for p in parts]
-        self._offsets = []
-        total = 0
-        for size in self._sizes:
-            self._offsets.append(total)
-            total += size
-        self._total_size = total
-        self._pos = 0
-        self._fh = None
-        self._fh_idx = None
+    if shutil.which("unzip") and _try_direct_unzip(main_zip, raw_dir, dest_dir):
+        print(f"[data_bootstrap] {base_name}: unzip read directly across "
+              f"split volumes, no reassembly needed")
+        for part in parts:
+            part.unlink()
+        return
 
-    def _part_index_for(self, pos):
-        for i in range(len(self._parts) - 1, -1, -1):
-            if pos >= self._offsets[i]:
-                return i
-        return 0
-
-    def _ensure_open(self, idx):
-        if self._fh_idx != idx:
-            if self._fh is not None:
-                self._fh.close()
-            self._fh = open(self._parts[idx], "rb")
-            self._fh_idx = idx
-
-    def seekable(self):
-        return True
-
-    def readable(self):
-        return True
-
-    def writable(self):
-        return False
-
-    def seek(self, offset, whence=0):
-        if whence == 0:
-            self._pos = offset
-        elif whence == 1:
-            self._pos += offset
-        elif whence == 2:
-            self._pos = self._total_size + offset
-        else:
-            raise ValueError(f"invalid whence: {whence}")
-        return self._pos
-
-    def tell(self):
-        return self._pos
-
-    def read(self, size=-1):
-        if size is None or size < 0:
-            size = self._total_size - self._pos
-
-        chunks = []
-        remaining = size
-        pos = self._pos
-        while remaining > 0 and pos < self._total_size:
-            idx = self._part_index_for(pos)
-            self._ensure_open(idx)
-            part_offset = pos - self._offsets[idx]
-            self._fh.seek(part_offset)
-            to_read = min(remaining, self._sizes[idx] - part_offset)
-            chunk = self._fh.read(to_read)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            pos += len(chunk)
-            remaining -= len(chunk)
-
-        self._pos = pos
-        return b"".join(chunks)
-
-    def close(self):
-        if self._fh is not None:
-            self._fh.close()
-            self._fh = None
-            self._fh_idx = None
-        super().close()
+    print(f"[data_bootstrap] {base_name}: direct split-read didn't work, "
+          f"falling back to `zip -s 0` reassembly (needs ~2x this archive's "
+          f"size in free disk space for this one step)...")
+    _ensure_zip_cli()
+    full_zip = raw_dir / f"{base_name}_full.zip"
+    subprocess.run(
+        ["zip", "-s", "0", str(main_zip), "--out", str(full_zip)],
+        check=True, cwd=str(raw_dir),
+    )
+    for part in parts:
+        part.unlink()
+    _extract_zip(full_zip, dest_dir)
+    full_zip.unlink()
 
 
-def _extract_zip(archive, dest_dir):
-    """archive: a Path, or a file-like object (_ChainedZipParts)."""
+def _try_direct_unzip(main_zip, raw_dir, dest_dir):
+    """Attempt to extract a split archive directly via the unzip CLI without
+    a separate reassembly step. Returns True on success, False on any
+    failure (leaving dest_dir cleaned up either way, so the caller can
+    safely fall back to reassembly).
+
+    stdin is closed rather than left inherited: some unzip builds prompt
+    interactively ("insert disk 2") for a split archive they can't read
+    automatically, and a closed stdin makes that fail fast instead of
+    hanging indefinitely.
+    """
+    try:
+        result = subprocess.run(
+            ["unzip", "-q", str(main_zip), "-d", str(dest_dir)],
+            cwd=str(raw_dir), stdin=subprocess.DEVNULL,
+            timeout=UNZIP_DIRECT_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        result = None
+
+    succeeded = result is not None and result.returncode == 0 and any(dest_dir.iterdir())
+    if not succeeded:
+        for child in dest_dir.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink()
+    return succeeded
+
+
+def _ensure_zip_cli():
+    """Make sure the `zip` CLI is available (needed to reassemble split
+    archives exactly the way the dataset's own instructions specify:
+    `zip -s 0 base.zip --out full.zip`)."""
+    if shutil.which("zip"):
+        return
+    print("[data_bootstrap] 'zip' CLI not found, attempting `apt-get install "
+          "zip` (Colab/Debian only)...")
+    try:
+        subprocess.run(["apt-get", "install", "-y", "-qq", "zip"], check=True)
+    except Exception as e:
+        raise RuntimeError(
+            "`zip` CLI is required to reassemble the split archive and could "
+            f"not be installed automatically ({e}). Install it manually "
+            "(e.g. `apt-get install zip` in Colab) and re-run."
+        )
+
+
+def _extract_zip(zip_path, dest_dir):
     import zipfile
-    with zipfile.ZipFile(archive, "r") as zf:
+    with zipfile.ZipFile(zip_path, "r") as zf:
         zf.extractall(dest_dir)
 
 
