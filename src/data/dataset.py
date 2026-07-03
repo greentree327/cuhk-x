@@ -9,7 +9,7 @@ Directory structure (training):
 Label extraction: the <action> folder name encodes the label.
     e.g., "0_Wash_face" → action_id = 0
 
-Handles missing modalities gracefully (returns empty tensors).
+Handles missing modalities gracefully (returns fixed-shape zero tensors).
 """
 import os
 from pathlib import Path
@@ -145,7 +145,7 @@ def build_clip_list(clips, labels):
 class HARDataset(Dataset):
     """PyTorch Dataset for CUHK-X multimodal action recognition.
 
-    Loads up to 6 modalities per clip. Missing modalities return empty tensors.
+    Loads up to 6 modalities per clip. Missing modalities return fixed-shape zero tensors.
 
     Args:
         clips: dict mapping (user, trial) → {modality: file_list}.
@@ -186,7 +186,11 @@ class HARDataset(Dataset):
                 and "Skeleton" in modalities):
             spatial_mask = self._compute_skeleton_mask(modalities)
 
-        # Load each modality (returns empty tensor if missing)
+        # Load each modality. Loaders always return a fixed-shape zero
+        # placeholder when a modality is missing or fails to parse — never a
+        # truly empty tensor — so every sample in a batch has identical shape
+        # per modality and collate_fn can stack without dropping rows (which
+        # would desync the batch from labels/flags).
         sample["imu"] = self._load_imu(modalities)
         sample["radar"] = self._load_radar(modalities)
         sample["skeleton"] = self._load_skeleton(modalities)
@@ -194,13 +198,14 @@ class HARDataset(Dataset):
         sample["ir"] = self._load_frames(modalities, "IR", spatial_mask)
         sample["thermal"] = self._load_frames(modalities, "Thermal", spatial_mask)
 
-        # Modality presence flags
-        sample["has_imu"] = torch.tensor(sample["imu"].numel() > 0, dtype=torch.float32)
-        sample["has_radar"] = torch.tensor(sample["radar"].numel() > 0, dtype=torch.float32)
-        sample["has_skeleton"] = torch.tensor(sample["skeleton"].numel() > 0, dtype=torch.float32)
-        sample["has_depth"] = torch.tensor(sample["depth_color"].numel() > 0, dtype=torch.float32)
-        sample["has_ir"] = torch.tensor(sample["ir"].numel() > 0, dtype=torch.float32)
-        sample["has_thermal"] = torch.tensor(sample["thermal"].numel() > 0, dtype=torch.float32)
+        # Modality presence flags: based on directory presence, not tensor
+        # emptiness (loaders never return empty tensors — see above).
+        sample["has_imu"] = torch.tensor("IMU" in modalities, dtype=torch.float32)
+        sample["has_radar"] = torch.tensor("Radar" in modalities, dtype=torch.float32)
+        sample["has_skeleton"] = torch.tensor("Skeleton" in modalities, dtype=torch.float32)
+        sample["has_depth"] = torch.tensor("Depth_Color" in modalities, dtype=torch.float32)
+        sample["has_ir"] = torch.tensor("IR" in modalities, dtype=torch.float32)
+        sample["has_thermal"] = torch.tensor("Thermal" in modalities, dtype=torch.float32)
 
         return sample
 
@@ -315,10 +320,11 @@ class HARDataset(Dataset):
 
         Returns:
             (imu_seq_len, 95) float tensor (19 feat × 5 sensors),
-            or empty tensor if IMU missing.
+            or zero-filled tensor of the same shape if IMU missing.
         """
         if "IMU" not in modalities:
-            return torch.empty(0)
+            return torch.zeros(self.config.imu_seq_len, self.config.imu_input_dim,
+                               dtype=torch.float32)
 
         from preprocessing.imu_utils import process_imu_trial
 
@@ -343,11 +349,12 @@ class HARDataset(Dataset):
 
         Returns:
             (radar_seq_len, max_points, 6) float tensor,
-            or empty tensor if Radar missing.
+            or zero-filled tensor of the same shape if Radar missing.
         """
         import pandas as pd
         if "Radar" not in modalities:
-            return torch.empty(0)
+            return torch.zeros(self.config.radar_seq_len, self.config.radar_max_points,
+                               self.config.radar_point_dim, dtype=torch.float32)
 
         try:
             radar_path = modalities["Radar"][0]
@@ -395,11 +402,11 @@ class HARDataset(Dataset):
 
         Returns:
             (skel_seq_len, 119) float tensor,
-            or empty tensor if Skeleton missing.
+            or zero-filled tensor of the same shape if Skeleton missing.
         """
         import json
         if "Skeleton" not in modalities:
-            return torch.empty(0)
+            return self._skeleton_fallback()
 
         try:
             # Find predictions/ directory
@@ -532,27 +539,31 @@ class HARDataset(Dataset):
 
         Returns:
             (N_frames, C, H, W) float tensor. C=3 for RGB, C=1 for IR.
-            Returns empty tensor if modality missing.
+            Returns a zero-filled tensor of the same shape if modality missing.
         """
         from PIL import Image
+
+        # Determine in_channels and frame count (needed for both the
+        # missing-modality placeholder and the real loading path)
+        if modality_name == "IR":
+            in_channels = 1
+            num_sample = self.config.num_frames
+        elif modality_name == "Thermal":
+            in_channels = 3
+            num_sample = self.config.num_thermal_frames
+        else:  # Depth_Color
+            in_channels = 3
+            num_sample = self.config.num_frames
+
         if modality_name not in modalities:
-            return torch.empty(0)
+            return torch.zeros(num_sample, in_channels, self.config.frame_size,
+                               self.config.frame_size, dtype=torch.float32)
 
         try:
             files = sorted(modalities[modality_name])
             if not files:
-                return torch.empty(0)
-
-            # Determine in_channels and frame count
-            if modality_name == "IR":
-                in_channels = 1
-                num_sample = self.config.num_frames
-            elif modality_name == "Thermal":
-                in_channels = 3
-                num_sample = self.config.num_thermal_frames
-            else:  # Depth_Color
-                in_channels = 3
-                num_sample = self.config.num_frames
+                return torch.zeros(num_sample, in_channels, self.config.frame_size,
+                                   self.config.frame_size, dtype=torch.float32)
 
             size = self.config.frame_size
             flags = self.config.flags

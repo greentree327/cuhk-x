@@ -320,6 +320,8 @@ class Trainer:
             batch[key] = batch[key] * mask
             flags[flag_key] = flags[flag_key] * mask.reshape(B)
 
+        return batch
+
     def _apply_mixup(self, batch):
         """Apply Mixup augmentation to the batch."""
         alpha = self.config.mixup_alpha

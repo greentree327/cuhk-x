@@ -77,11 +77,17 @@ class FusionHead(nn.Module):
         fused = []
 
         for i, emb in enumerate(embeddings):
+            token = self.missing_tokens[i].expand(batch_size, -1)
             if emb.numel() == 0 or emb.shape[0] == 0:
-                token = self.missing_tokens[i].expand(batch_size, -1)
+                # Modality absent for the entire batch (e.g. never present
+                # in the dataset at all) — use the learned token outright.
                 fused.append(token)
             else:
-                fused.append(emb)
+                # Per-sample substitution: rows where this modality is
+                # missing for that sample get the learned token instead of
+                # the encoder's output on zero-placeholder input.
+                present = flags[:, i].unsqueeze(-1)  # (batch, 1)
+                fused.append(present * emb + (1.0 - present) * token)
 
         x = torch.cat(fused, dim=-1)
         penultimate = self.mlp(x)
