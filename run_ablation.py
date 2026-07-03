@@ -23,6 +23,7 @@ from datetime import datetime
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.config import Config
+from src.data_bootstrap import ensure_dataset_available
 
 
 # Overridable so checkpoints/logs can be redirected to persistent storage
@@ -104,6 +105,12 @@ def run_config(label, cfg):
 
 
 def main():
+    # Fetch the dataset from Hugging Face if it isn't already extracted in
+    # place (no-op locally where it already exists; required in a fresh
+    # Colab clone — see download_data.py for the one-time HF_TOKEN setup).
+    log("\n[0/4] Checking dataset availability...")
+    ensure_dataset_available(Config())
+
     # Configs
     # batch_size=64 OOMs on an 8GB GPU once all 6 modality encoders run together
     # (measured peak ~10.4GB reserved at batch_size=32, already over physical
