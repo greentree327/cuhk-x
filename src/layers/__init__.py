@@ -152,7 +152,9 @@ class AttentionPooling(nn.Module):
             (batch, hidden_dim) pooled feature vector.
         """
         scores = self.attention(x).squeeze(-1)  # (batch, seq_len)
-        scores = scores.masked_fill(~mask.bool(), -1e9)
+        # Use the dtype's own min (not a hardcoded -1e9) so this stays finite
+        # under AMP, where scores is float16 and -1e9 overflows to -inf/NaN.
+        scores = scores.masked_fill(~mask.bool(), torch.finfo(scores.dtype).min)
         weights = F.softmax(scores, dim=1)
         weights = weights * mask
         weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)
@@ -185,7 +187,7 @@ class PhaseAttentionLayer(nn.Module):
             (batch, hidden_dim).
         """
         scores = torch.tanh(self.attention(x)).squeeze(-1)
-        scores = scores.masked_fill(~mask.bool(), -1e9)
+        scores = scores.masked_fill(~mask.bool(), torch.finfo(scores.dtype).min)
         attention_weights = F.softmax(scores, dim=1)
         combined = attention_weights * phase_weights * mask
         combined = combined / (combined.sum(dim=1, keepdim=True) + 1e-8)
@@ -239,7 +241,7 @@ class SegmentPooling(nn.Module):
             m_seg = mask[:, t_start:t_end]           # (B, seg_len)
 
             scores = self.attentions[seg_idx](x_seg).squeeze(-1)
-            scores = scores.masked_fill(~m_seg.bool(), -1e9)
+            scores = scores.masked_fill(~m_seg.bool(), torch.finfo(scores.dtype).min)
             weights = F.softmax(scores, dim=1)
             weights = weights * m_seg
             weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)

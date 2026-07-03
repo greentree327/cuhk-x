@@ -100,7 +100,12 @@ def run_config(label, cfg):
 
 def main():
     # Configs
-    base = dict(epochs=60, n_folds=5, batch_size=64, num_workers=2, mixed_precision=True)
+    # batch_size=64 OOMs on an 8GB GPU once all 6 modality encoders run together
+    # (measured peak ~10.4GB reserved at batch_size=32, already over physical
+    # VRAM and only surviving via WDDM's memory oversubscription — it would
+    # eventually OOM over a full 60-epoch run as fragmentation grows).
+    # batch_size=16 leaves a safe margin (~5.3GB peak reserved).
+    base = dict(epochs=60, n_folds=5, batch_size=16, num_workers=2, mixed_precision=True)
 
     c1 = Config()
     c1.output_dir = Path("output/minimal")

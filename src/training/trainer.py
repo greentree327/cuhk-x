@@ -82,7 +82,7 @@ class Trainer:
         # Loss with optional class weighting
         class_weights = None
         if config.flags.use_class_weights:
-            class_weights = self._compute_class_weights(train_clips)
+            class_weights = self._compute_class_weights(train_clips, config.num_classes)
             class_weights = class_weights.to(self.device)
         self.criterion = nn.CrossEntropyLoss(
             weight=class_weights, label_smoothing=config.label_smoothing
@@ -115,7 +115,7 @@ class Trainer:
         self.best_acc = 0.0
 
     @staticmethod
-    def _compute_class_weights(clip_list):
+    def _compute_class_weights(clip_list, num_classes):
         """Compute inverse-sqrt class weights to handle 27.5:1 imbalance.
 
         Dampened inverse frequency: weight = 1 / sqrt(class_count).
@@ -124,6 +124,10 @@ class Trainer:
 
         Args:
             clip_list: list of (user_id, user, trial, action_id) tuples.
+            num_classes: total number of classes the model predicts (config.num_classes).
+                Must NOT be inferred from clip_list — a given train fold can
+                happen to omit the globally rarest class entirely, which would
+                silently shrink the weight vector below the classifier's width.
 
         Returns:
             (num_classes,) float tensor of class weights.
@@ -132,7 +136,6 @@ class Trainer:
         from collections import Counter
 
         counts = Counter(item[3] for item in clip_list)
-        num_classes = max(counts.keys()) + 1
         weights = np.ones(num_classes, dtype=np.float32)
 
         for cls_id in range(num_classes):
@@ -161,7 +164,9 @@ class Trainer:
             if self.config.modality_dropout_p > 0:
                 batch = self._apply_modality_dropout(batch)
 
-            # Mixup
+            # Mixup overwrites batch["label"] with a soft one-hot mix, so keep
+            # the hard label around for the accuracy metric below.
+            hard_label = batch["label"]
             use_mixup = self.config.mixup_alpha > 0 and np.random.random() < 0.5
             if use_mixup:
                 batch = self._apply_mixup(batch)
@@ -199,8 +204,8 @@ class Trainer:
             self.ema.update()
 
             # Metrics
-            acc = accuracy(logits.detach(), batch["label"], topk=(1,))[0]
-            batch_size = batch["label"].size(0)
+            acc = accuracy(logits.detach(), hard_label, topk=(1,))[0]
+            batch_size = hard_label.size(0)
             loss_meter.update(loss.item(), batch_size)
             acc_meter.update(acc, batch_size)
 
@@ -279,10 +284,10 @@ class Trainer:
             if is_best:
                 self.best_acc = val_acc
                 self._save_checkpoint(epoch, val_acc, is_best=True)
-                print(f"  → New best! Saved to {self.best_model_path}")
+                print(f"  -> New best! Saved to {self.best_model_path}")
 
             if self.early_stopping.early_stop:
-                print(f"  → Early stopping at epoch {epoch+1}")
+                print(f"  -> Early stopping at epoch {epoch+1}")
                 break
 
         print(f"\n  Fold {self.fold + 1} complete. Best Val Acc: {self.best_acc:.2f}%\n")

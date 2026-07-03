@@ -449,7 +449,7 @@ class HARDataset(Dataset):
             spine = kps_array[:, 7, :]
             spine_len = np.linalg.norm(spine, axis=-1, keepdims=True)
             spine_len = np.where(spine_len < 1e-6, 1.0, spine_len)
-            kps_array = kps_array / spine_len[:, None, None]
+            kps_array = kps_array / spine_len[:, :, None]
 
             # --- Raw-only mode: positions only, 51 dims ---
             if not self.config.flags.use_synthesized_features:
