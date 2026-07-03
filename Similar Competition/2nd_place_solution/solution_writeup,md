@@ -1,0 +1,329 @@
+First, thanks to the organizers and hosts for an interesting competition, and to the community for insightful discussions and notebooks.
+
+Overview
+If you watched the leaderboard, you may have noticed a late jump: I discovered a dataset trick four days before the deadline and boosted the score substantially via post-processing.
+Without post-processing, my model scores were: Public 0.865 / Private 0.858.
+Below I first describe the model (data handling, features, architecture, training), then the post-processing that made the big difference.
+Model
+Handling Missingness
+
+Training separate models gave better accuracy when certain sensors were missing.
+I trained four variants depending on whether IMU rotation was missing and whether THM/TOF were missing (rot present/absent × THM and TOF present/absent).
+Feature Engineering
+
+IMU
+
+acc(x/y/z)
+quaternion 6D representation (to avoid discontinuities)
+angular velocity(x/y/z)
+linear acceleration(x/y/z)
+THM/TOF
+
+Filled NaN and -1 with zero.
+I did not use THM.
+Left-handed subjects
+
+Multiply by −1: acc_x, linear_acc_x, angular velocity y and z, and components 0 and 4 of the quaternion 6D representation.
+Swap tof_3 and tof_5, and horizontally flip the left–right direction of the 2D TOF grids.
+Subject-specific correction
+
+In the training data, data from SUBJ_019262 and SUBJ_045235 were rotated by 180° around the z-axis.
+I multiplied all channels by −1 except acc_z and linear_acc_z.
+I could not find a reliable correction for their TOF, so I set TOF to NaN for these subjects.
+Architecture
+
+Based on public notebooks: a Residual SE-CNN Block + Attention model.
+Modality-specific stems:
+Independent 1D CNN branches for each of: acc, quaternion 6D, angular velocity, linear_acc, and each tof1~5; then concatenate.
+TOF processing:
+Before 1D CNN branches, I use a 2D CNN on the TOF grids per frame, followed by mean pooling to get a per-step feature.
+Phase-aware Attention
+Plain temporal attention can over-focus on long phases (e.g., long transitions to the target).
+I add an auxiliary 3-class phase predictor at each time step:
+(Relaxes and) Moves hand to target location
+Hand at target location
+Performs gesture
+I construct three attentions, one per phase, and weight each attention score by the corresponding phase probability. This extracts features specific to each phase instead of letting long phases dominate.
+Prediction Target
+
+I predict a composite label:(Initial behavior ∈ {Relaxes&Moves / Moves}, orientation, gesture).
+This choice is important for the post-processing step.
+Mixup
+
+Simple linear mixup, but phase-aligned to avoid mixing behaviors:
+Split each sequence into the three phases above and mix within the same phase only.
+Especially for “moves to target,” I align the end of the phase so the arrival at the target is synchronized before mixing.
+Training Details
+
+Optimizer: Adam (lr=1e-3, wd=1e-4)
+Scheduler: Cosine Annealing
+Batch size: 32
+Epochs: 50
+Folds: 10
+Final model: ensemble of 3 variants (different depths/layers of 1DCNN)
+Online Pseudo-Labeling
+
+With ~8k training sequences and ~3.5k test sequences, pseudo labels helped.
+The submission API predicts one sequence at a time, so I performed test-time updates: whenever a batch-sized group of test sequences accumulated, I fine-tuned one step with a small LR (5e-5) using pseudo labels.
+Post-Processing
+Key observation from train.csv:
+
+There are 4 orientations × 18 gestures = 72 possible (orientation, gesture) pairs, but only 51 were actually present.
+For each subject, the dataset contains exactly those 51 pairs, each recorded with two possible initial behaviors (Relaxes&Moves / Moves), totaling 51 × 2 = 102 sequences per subject.
+Based on this, I trained the model to predict 102 classes (the composite label described above).
+Maximizing Conditional Joint Probability (with no-repeat constraint)
+
+For each subject, I keep all predicted class probabilities across their sequences.
+When predicting the N-th sequence for that subject, instead of taking the argmax for the N-th item independently, I choose the class sequence of length N that maximizes the joint probability (sum of log-probabilities) subject to “no label is used twice.”
+Because labels are assigned jointly per subject under a no-repeat constraint, early high-confidence picks lock in their labels; when a later sample is only moderately confident in a label that’s already taken, an alternative is chosen to yield a higher joint log-likelihood.
+Computationally, this is an assignment problem solvable efficiently (e.g., Hungarian algorithm) using negative log-probabilities as costs.
+Scores
+Method	Public LB	Private LB
+No pseudo / No post-proc	0.862	0.854
+With pseudo / No post-proc	0.865	0.858
+No pseudo / With post-proc	0.891	0.875
+With pseudo / With post-proc	0.900	0.878
+Codes
+github
+
+Author
+daiwakun
+daiwakun
+
+
+Share
+Citation
+daiwakun. 2nd Place Solution. https://www.kaggle.com/competitions/cmi-detect-behavior-with-sensor-data/writeups/2nd-place-solution. 2025. Kaggle
+
+
+React
+20 Comments
+1 appreciation comment
+Hotness
+ 
+Comment here. Be patient, be friendly, and focus on ideas. We're all here to learn and improve!
+This comment will be made public once posted.
+
+
+Post Comment
+Fnoa
+Posted 10 months ago
+
+· 9th in this Competition
+
+I used a similar approach with the targets but excluded Initial behavior ∈ {Relaxes&Moves / Moves}, resulting in 51 targets total. I'm curious about how much performance difference there would be using 102 targets instead of 51 - it would be interesting to see that comparison!
+Congratulations on the incredible performance and innovative approach!
+
+
+Reply
+
+React
+Theo Viel
+Posted 10 months ago
+
+· 3rd in this Competition
+
+Congratz on 2nd place !
+
+Your sudden jump in LB was one of the clues that helped us find the trick - given your background in optimization :)
+
+We figured part of it, but your approach is definitely better.
+
+
+Reply
+
+React
+Mauro Abidal Carrer
+Posted 10 months ago
+
+· 146th in this Competition
+
+The meta of Kaggle competitions is wild lol.
+
+
+Reply
+
+React
+EliKal
+Posted 10 months ago
+
+· 72nd in this Competition
+
+The idea of training 102 classes is wild!! Well deserved
+
+
+Reply
+
+React
+Ashwin Ashok
+Posted 10 months ago
+
+102 😲, damn!
+
+
+Reply
+
+React
+Jason Wood
+Posted 10 months ago
+
+Congrats on the 2nd place! Really impressed by the subject-specific corrections; especially the 180° rotation fix; and the way you structured separate models for missing sensor cases. The phase-aware attention with the auxiliary phase predictor is a clever way to balance long vs. short phases, and predicting the composite label set up the post-processing beautifully. The Hungarian assignment trick on top of that was a brilliant use of dataset structure. Thanks for the detailed breakdown; lots of takeaways here!
+
+
+Reply
+
+React
+Ashwin Ashok
+Posted 10 months ago
+
+Congrats Bro!!!
+Issue: My code submission is failing with an error. I am unable to resolve this despite multiple attempts.
+
+This is my Code : cmi-watch-sensors_final
+
+I was only able to catch 64% accuracy with XGBoost and CatBoost & 62% with Pytorch
+
+A Journey of Discovery
+This project served as a profound learning experience, challenging my initial assumptions about feature engineering. The multi-class, grouped nature of the dataset forced a re-evaluation of my approach and opened my eyes to the vast, intricate landscape of data science. This competition was an invaluable "first" for me, highlighting the need to constantly evolve and think creatively to solve complex problems.
+
+
+Reply
+
+React
+Y. Xiao
+Posted 10 months ago
+
+· 2418th in this Competition
+
+Hi, in your write up: In the training data, data from SUBJ_019262 and SUBJ_045235 were rotated by 180° around the z-axis.
+How do you find this, can you elaborate. Thanks.
+
+
+Reply
+
+React
+josiah
+Posted 10 months ago
+
+Congrats on 2nd place!!!
+
+
+Reply
+
+React
+Gerwyn
+Posted 10 months ago
+
+· 61st in this Competition
+
+Without post-processing, my model scores were: Public 0.865 / Private 0.858.
+
+Congrats. I think your models are really strong even without the post-processing!
+
+Which step do you think has the highest impact for your modelling approach? (arch, feature-engineering, handling nan, augmentation)
+
+
+Reply
+
+React
+moth
+Posted 10 months ago
+
+· 375th in this Competition
+
+If each prediction is final and cannot be changed afterwards wouldn't that make early mistakes propagate? For example, if:
+
+In the first prediction the model incorrectly predicts sequence 1 as of class 1.
+Now, imagine that later (e.g. sequence 50) the model correctly predicts sequence 50 as of class 1. Would the algorithm not be able to assign it to class 1 anymore, because that label is already used?
+This would cause a double error.
+
+Perhaps I didn't understand exactly your post-processing approach.
+
+Congratz!
+
+
+Reply
+
+React
+Gerwyn
+Posted 10 months ago
+
+· 61st in this Competition
+
+my interpretation is that there is always a chance of making double error, but "maximizes the joint probability" was superior than just taking "argmax independently"
+
+
+Reply
+
+React
+daiwakun
+Topic Author
+Posted 10 months ago
+
+· 2nd in this Competition
+
+Thanks! You’re right that if a predicted probability is extremely close to 1, it’s effectively fixed—but my method doesn’t hard-lock past predictions.
+
+In your example, even if sequence 1 was initially assigned class 1, when I get to sequence 50 I recompute the best joint assignment for sequences 1–50 from scratch, under the no-repeat constraint, by maximizing the sum of log-probabilities. That means sequence 1 can be reassigned if it improves the overall joint likelihood, which can free up class 1 for sequence 50 if that’s the better global choice.
+
+So early mistakes don’t necessarily propagate: at each step, I re-optimize the joint assignment for all sequences seen so far. This outperforms per-sample argmax on the set {1…50} as a whole. Ultimately, I only predict sequence 50 at that step, but I can still improve its accuracy.
+
+
+Reply
+
+4
+Kris Xu
+Posted 10 months ago
+
+· 145th in this Competition
+
+Perfect work! congrats!
+
+
+Reply
+
+React
+Artem Bakalinskiy
+Posted 10 months ago
+
+· 235th in this Competition
+
+Awsome! Congratulations!
+
+
+Reply
+
+React
+yuanzhe zhou
+Posted 10 months ago
+
+· 1st in this Competition
+
+Great work! I tried to use LSTM for this task but the result was really poor.
+
+
+Reply
+
+React
+hyd
+Posted 10 months ago
+
+· 22nd in this Competition
+
+The post-processing method is really smart, it's just like(maybe slightly better than) add a transformer model to learn the sequence information!
+
+
+Reply
+
+React
+Konstantin Yakovlev
+Posted 10 months ago
+
+· 8th in this Competition
+
+Elegant - super cool!
+
+
+Reply
+
+React

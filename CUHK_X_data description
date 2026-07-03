@@ -1,0 +1,141 @@
+The Dataset
+How CUHK-X was captured — the multi-room sensor rig, the seven synchronized modalities, 40 everyday action categories, and what one recording looks like across every stream.
+
+Hardware and Environment Setup
+We spans a multi-room home and supports three tasks: HAR, HAU (captioning task), and HARn (question answering task), integrating diverse modalities, including RGB, depth, thermal, infrared, IMU, skeleton, and mmWave, to enable robust perception and reasoning in complex indoor contexts.
+
+CUHK-X was collected using a sophisticated multi-sensor setup ensuring synchronized data capture across all modalities:
+
+Vzense NYX 650
+RGB-D camera providing color and depth information
+
+Texas Instruments Radar
+mmWave sensing for privacy-preserving motion detection
+
+IMU Sensors
+Motion and orientation tracking with high temporal resolution
+
+Thermal Cameras
+Heat signature analysis for environmental robustness
+
+Synchronized Recording
+Temporal alignment across all modalities for consistent analysis
+
+Hardware setup showing the multi-sensor configuration
+Layout with room-wise visual annotations (Bedroom, Kitchen, Bathroom, and Living Room) showing corresponding example images and sensor placements. The icon indicates the location of the ambient sensor:
+
+Background
+Dataset Overview
+CUHK-X represents a significant advancement in multimodal human activity datasets, featuring:
+
+Seven Synchronized Modalities: RGB, Infrared (IR), Depth, Thermal, IMU, mmWave Radar, and Skeleton data
+Large-Scale: 64,267 annotated action samples from 30 diverse participants
+Dual Data Structure: Both singular actions (30,000+ samples) and sequential activities for temporal reasoning
+Rich Annotations: LLM-generated captions with human-in-the-loop validation
+Environmental Diversity: Indoor and outdoor settings with varying conditions
+Modality Specifications
+🎥
+RGB Video
+Standard color video recordings
+📏
+Depth
+3D spatial information from depth cameras
+🔥
+Thermal
+Heat signature analysis
+🌡️
+Infrared (IR)
+Thermal imaging for lighting robustness
+📡
+mmWave Radar
+Privacy-preserving motion detection
+🦴
+Skeleton
+3D pose estimation and joint tracking
+📱
+IMU
+Inertial Measurement Unit for motion
+Dataset overview showing modality examples
+Action Categories and Distribution
+Categories
+Personal Care (6 actions)
+Washing face, Brushing teeth, Combing hair, Undressing, Wiping hands, Getting Dressed
+Eating and Drinking (6 actions)
+Drinking, Eating, Grabbing utensils, Pouring, Stirring, Peeling fruit
+Household (5 actions)
+Sweeping, Mopping, Washing dishes, Wiping surface, Folding clothes
+Working (6 actions)
+Typing on a keyboard, Writing, Calling, Checking the time, Reading, Turning a page
+Socializing and Leisure (5 actions)
+Taking a selfie, Playing board games, Watching TV, Using a phone, Listening to the music with headphones
+Sports and Exercises (9 actions)
+Walking, Lunges, Sitting down, Lying down, Standing up, Stretching, Jumping jacks, Squats, Running
+Caring and Helping (3 actions)
+Taking medicine, Checking body temperature, Massaging oneself
+Action categories and distribution
+Distribution
+Distribution Feature:> The dataset follows a long-tail distribution (a small number of actions account for a large proportion of occurrences, while most are infrequent), consistent with the common imbalance of real-world datasets.
+Category Diversity: Covers basic daily activities, work-related tasks, household chores, and physical exercises, providing a rich foundation for human activity recognition.
+Data Scale:
+Each participant contributes over 30 minutes of footage with more than 100 samples.
+Vision modality includes 4,029 clips (total duration: 19 hours and 29 minutes).
+Action frequency
+Data Visualization
+This is an example that includes seven modalities: RGB, IR, Thermal, Depth, Skeleton, Radar, and IMU, which were recorded at the same time. We have a 9-axis IMU, but we've only shown these data for simplicity.
+
+Benchmarks & Results
+Three benchmarks of increasing difficulty — recognition (HAR), understanding (HAU) and reasoning (HARn) — and how today's models score on each.
+
+Benchmarks & Tasks
+CUHK-X provides three comprehensive benchmarks that progressively increase in complexity, from basic recognition to advanced reasoning:
+
+🎯
+HAR - Human Action Recognition
+Objective: Traditional action classification across modalities
+
+Cross-subject evaluation (LOSO protocol)
+Cross-domain performance analysis
+Long-tail distribution handling
+Multimodal fusion strategies
+
+Novel Data Collection Framework
+Leveraging Large Language Models to generate consistent, logical activity descriptions that participants then perform. This approach ensures:
+
+Logical Consistency:
+Activities follow natural progression and causality
+
+Spatio-temporal Coherence:
+Actions are contextually appropriate
+
+Human-in-the-Loop Validation:
+Quality assurance for generated scenarios
+
+Scalable Annotation:
+Efficient generation of diverse scenarios
+
+Experimental Results
+Key Findings
+Our comprehensive evaluation across the three benchmarks reveals several important insights:
+
+🎯 HAR Performance
+Modality	Accuracy	Precision	Recall	F1-Score
+RGB	90.89%	92.24%	91.02%	91.28%
+Depth	90.46%	91.76%	90.75%	90.93%
+IR	90.22%	91.53%	89.94%	90.46%
+Thermal	92.57%	93.54%	93.50%	93.36%
+mmWave	46.63%	48.29%	46.63%	44.53%
+IMU	45.52%	40.84%	38.00%	38.32%
+Skeleton	79.08%	91.46%	79.08%	84.17%
+🧠 HAU Performance Highlights
+These three images represent the results of action selection, emotion analysis, and action sequence, respectively.
+QwenVL-7B: Consistently best performer across tasks
+VLLaVA-7B: Strong performance in depth and IR modalities
+Emotion Analysis: Up to 77.77% accuracy with thermal imaging
+Sequential Reordering: 68.5% accuracy for complex temporal reasoning
+action_selectionemotion_analysissequential_action
+🔮 HARn Insights
+Reasoning vs Captioning: Reasoning models significantly outperform captioning models
+Modality Impact: Depth and IR often superior to RGB for reasoning tasks
+Model Scale: Larger models (7B) consistently outperform smaller ones
+Context Understanding: Critical for next action prediction accuracy
+HARn result

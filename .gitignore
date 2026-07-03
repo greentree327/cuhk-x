@@ -1,0 +1,13 @@
+CUHK-X_Small_Model_Track/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Outputs / logs
+output/
+
+# OS
+.DS_Store

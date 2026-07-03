@@ -1,0 +1,406 @@
+First of all, I would like to thank the competition hosts and all the participants for their efforts and contributions. It’s inspiring to see such creativity and dedication. I am also thrilled to have placed in the prize-winning range. Below, I would like to share an overview of my solution.
+
+Brief Summary
+The main points of my solution are as follows:
+
+Used a custom neural network with separate 1D-CNN branches, one for each sensor modality
+Extracted the last 75 frames of each sequence as inputs to the NN
+Estimated gesture segments with a simple U-Net and added them as additional inputs
+Converted left-handed data to align with right-handed data
+Identified subjects who wore devices upside down (rotated by 180° around the z-axis) and corrected their data
+Trained two nearly identical NNs (differing only in input blocks) 50 times each on the full dataset with different random seeds, then averaged the outputs of all 100 NNs
+Did not apply any post-processing
+Here are the cross-validation (CV) and leaderboard (LB) scores. Cross-validation was performed using 10-fold StratifiedGroupKFold.
+
+Model	CV or full-train	Handle upside-down
+devices in test	CV
+(single seed)	CV
+(5-seed average)	Public LB	Private LB
+1	CV	False	0.864
+(0.894, 0.834)	0.874
+(0.905, 0.843)	0.869	0.860
+2	CV	False	0.862
+(0.892, 0.833)	0.875
+(0.904, 0.846)	0.874	0.856
+1 + 2	CV	False	-	0.877
+(0.906, 0.849)	0.873	0.858
+1 + 2	full-train	False	-	-	0.871	0.860
+1 + 2	full-train	True	-	-	0.871	0.873
+The notebook for model 1 in the table is linked below.
+https://www.kaggle.com/code/rsakata/cmi3-6th-place-solution-partial
+
+Neural Network Architecture
+Of the two gesture classification neural networks, the structure of one is shown below. The other differs only slightly in the input feature blocks.
+
+
+
+Each input feature block (shown on the left) is processed with 1D-CNN and MLP layers. It was important to perform the first convolution in each 1D-CNN block as a grouped convolution by channel.
+
+Before the MLP layers, the 1D-CNN outputs are pooled along the time axis. Instead of simple global average pooling, pooling is done separately over the gesture and non-gesture segments, and the results are concatenated as the input to the MLP. To enable this, gesture segments were pre-estimated with a U-Net and added as inputs. (The U-Net structure was quite simple, with no special tricks, so I omit the details here.)
+
+The final prediction is obtained by combining the outputs from all blocks. Following the problem setup, the model produces predictions using both all inputs and IMU-only inputs. Additionally, separate predictions are generated for each block.
+
+Cross-entropy loss is calculated for all predictions and used for backpropagation. The loss weights are: 1/4 each for the all-input and IMU-only predictions, and 1/12 for each of the six block-specific predictions.
+
+In addition to predicting gestures (18 classes), the network also predicts orientation (4 classes), added as an auxiliary loss weighted at 0.5 relative to the gesture loss. Non-target gestures were not compressed; the model was trained as an 18-class classification task, since early experiments showed this performed slightly better.
+
+For inference on the test set, if more than 50% of TOF values were missing, the IMU-only prediction was used; otherwise, the all-input prediction was used.
+
+I will provide explanations for several feature blocks in the figure.
+
+derived_acc
+This block consists of the three components of linear_acc and the three components of global_acc. linear_acc is acceleration with gravity removed, calculated the same way as in many public notebooks. global_acc is acceleration expressed in the global (world) coordinate system; see the discussion in the link below.
+https://www.kaggle.com/competitions/cmi-detect-behavior-with-sensor-data/discussion/583080
+
+rotvec_diff
+This is essentially equivalent to what was calculated as angular_vel in public notebooks. (The division by time is omitted since the values are later standardized.)
+
+tof
+Before temporal convolution, each of the five TOF sensors’ values was spatially convolved on an 8×8 grid. After three rounds of stride-2 max pooling, the spatial dimensions were fully collapsed, producing 32 channels per sensor (160 in total). The resulting feature maps were then processed with temporal convolution in the same way as the other blocks.
+
+Preprocessing
+Handling Left-Handed Subjects
+One of the most important preprocessing steps was handling left-handed subjects.
+
+For acc features, the fix was simple. Because these features are symmetric left–right, flipping the sign of the x component was enough to convert left-handed data into right-handed. This is clearly visible in the acc histograms below.
+
+
+
+For rot features, things were more complicated, so I’ll start with rotvec_diff. Note that rotation around the x-axis is the same for both left- and right-handed subjects (like twisting a motorcycle throttle). In contrast, the y and z components had to be sign-flipped — a step that proved critical for improving accuracy for left-handed subjects.
+
+At first glance, it might seem that flipping y and z would also be enough for rot values. However, rotation around the z-axis depends on the subject’s facing direction (unless all subjects performed gestures facing true north). So I first canceled out the angle relative to true north, then flipped rot_y and rot_z. After aligning the left- and right-handed histograms, the subjects’ facing direction was estimated at roughly 130° from north (likely southwest).
+The before-and-after histograms below confirm that the distributions matched after this transformation.
+
+
+
+
+
+However, this preprocessing is only possible because all subjects faced the same direction during data collection. For real-world use, models shouldn’t depend on absolute orientation, so excluding rot (and global_acc) values entirely might be a better approach.
+
+For sensor placement, I also mirrored some values: thm_3/tof_3 were swapped with thm_5/tof_5, and each TOF sensor’s v0–63 values were flipped left–right.
+
+These steps resulted in a gesture classification accuracy of about 85% for left-handed subjects with IMU+THM+TOF in CV.
+
+Handling Upside-Down Devices
+Another key finding was that two subjects wore the device rotated 180° around the z-axis — specifically, SUBJ_019262 and SUBJ_045235. The histograms below compare these subjects with the rest.
+
+
+
+The fact that acc_x and acc_y distributions appeared flipped strongly suggests the devices were worn upside down. I corrected the sensor values as if the devices had been worn properly:
+
+For acc: flip the signs of x and y components
+For rotvec_diff: flip the signs of x and y components (z returns to original after two flips)
+For rot: add a 180° rotation around the z-axis, and flip the signs of x and y components
+Swap thm_2 with thm_4, and tof_2 with tof_4
+Swap thm_3 with thm_5, and tof_3 with tof_5
+Rotate the v0–63 values of TOF sensors
+These corrections not only drastically improved accuracy for the two affected subjects (accuracy exceeded 90% with IMU+THM+TOF in CV) but also gave a small boost to other subjects.
+
+To prepare for similar cases in the test set, I also trained a model to detect whether a sequence was recorded with a 180° device rotation. The model architecture was exactly the same as that of the gesture classification network, differing only in the number of output classes.
+
+Since this didn’t improve the Public Score, I wasn’t sure whether to include it. In the end, I added it to one of my final submissions but not the other. It turned out to make a big difference on the Private Score (+0.013), which significantly improved my Private Leaderboard rank.
+
+Other Simple Preprocessing
+Additionally, a few other simple preprocessing steps were applied:
+
+For thm: Values below 20 °C were treated as outliers and replaced with nulls (filled with 0 after standardization)
+For tof: Values of –1 were replaced with 255
+Others
+Optimizer: I used RAdamScheduleFree. In the final stage, I attempted to switch to AdamW and tune it, and although I was able to reach similar performance, it did not clearly surpass the previous results, so I continued using RAdamScheduleFree until the end.
+Data augmentation and mix-up: I could not get them to work effectively, so I did not adopt them.
+EMA: I also tried using EMA, which improved single CV results, but its effect disappeared when combined with seed averaging, so I ultimately decided not to use it.
+Thank you for reading!
+
+Author
+Jack (Japan)
+rsakata
+
+
+Share
+Citation
+Jack (Japan). 6th Place Solution. https://www.kaggle.com/competitions/cmi-detect-behavior-with-sensor-data/writeups/6th-place-solution. 2025. Kaggle
+
+
+React
+20 Comments
+2 appreciation comments
+Hotness
+ 
+Comment here. Be patient, be friendly, and focus on ideas. We're all here to learn and improve!
+This comment will be made public once posted.
+
+
+Post Comment
+Summer
+Posted 9 months ago
+
+· 823rd in this Competition
+
+Hi, thank you and congrats on the marvellous notebook and results, I have a question that confuses me.
+The IMU unit didn't specify which Coordinate Systems (Left-Handed vs. Right-Handed) they are using, but they must use one of the above system, right?
+Assume they use right-handed coord system (same logic applies to the other coord system), I have 2 different format of right-hand coordinate system below, which one is being used and why? I think you adopted the second format, otherwise it wouldn't make sense to cancel out different facing directions across different subjects along z-axis , may I know the reason/intuition behind? thanks a lot.
+
+
+
+
+
+Reply
+
+React
+Jack (Japan)
+Topic Author
+Posted 9 months ago
+
+· 6th in this Competition
+
+When computing the global (world) acceleration from acc and rot features, you can observe that gravitational acceleration appears along the z-axis. This suggests that the z-axis corresponds to the vertical direction.
+
+
+Reply
+
+React
+Summer
+Posted 9 months ago
+
+· 823rd in this Competition
+
+thanks a lot ><, I learn a lot from this notebook
+
+
+Reply
+
+React
+greySnow
+Posted 10 months ago
+
+· 18th in this Competition
+
+Since this didn’t improve the Public Score, I wasn’t sure whether to include it.
+In the end, I added it to one of my final submissions but not the other.
+It turned out to make a big difference on the Private Score (+0.013), which significantly improved my Private Leaderboard rank.
+
+Yep, it's a secret, I was wondering who will find it since it's not trivial.
+I did the same as you i.e. training a model to detect if a sequence is flipped x+y (should have been rotated around z 180 degree but the difference is small).
+At first, I planned to aggregate the scores of this model for each subject, and if a subject has majority flipped, then it's probably a flipped subject.
+Then I probed to see if there is at least 1 such subject that has majority of sequences flipped…there wasn't even 1.
+But I was not convinced lol…I suspected I had a bug in the aggregation.
+So I probed to see if there are any identified flipped sequences at all, my probing said there are ~30-40.
+Which was way higher then the number expected from error of the model if no sequense was flipped.
+I probed further, and deduced that all or at least most of the flipped sequences are in private test.
+For me, for same model: 0.86/0.849 without flipping correction, 0.86/0.857 with correction.
+
+This mean that there is at least one subject, that has some sequences flipped x+y, but it's less than the majority of it's sequences! (or at least less that a significant majority).
+I find it very interesting!
+
+
+Reply
+
+React
+minerppdy
+Posted 10 months ago
+
+· 3rd in this Competition
+
+"This mean that there is at least one subject, that has some sequences flipped x+y, but it's less than the majority of it's sequences! " Ohhhh! That makes scence, I probe with the assumption that all sequneces would flip if a subject is incorrect wearing, which leading to a wrong conclution.
+
+
+Reply
+
+React
+greySnow
+Posted 10 months ago
+
+· 18th in this Competition
+
+When I saw this, I was like 'well, knowing Kagglers, I'm sure that some will probe for flipped subject, but conclude that there is none'.
+Glad to see I was right 🤣
+
+
+Reply
+
+React
+This comment has been deleted.
+
+This comment has been deleted.
+
+Fae Gaze
+Posted 10 months ago
+
+· 343rd in this Competition
+
+Congrats on your 6th place solution 👏, and thank you for the very detailed write-up!
+
+I noticed your CV (single seed) scores are in the 0.86–0.87 range, and the averaged CV gets close to 0.88, which is similar to the Public/Private LB results.
+
+Could you share a bit more on how well your 10-fold StratifiedGroupKFold CV tracked the leaderboard scores? Did you find that CV tended to slightly overestimate/underestimate the private LB, or was it generally well aligned?
+
+
+Reply
+
+React
+Jack (Japan)
+Topic Author
+Posted 10 months ago
+
+· 6th in this Competition
+
+I didn’t make many submissions, and the differences between them didn’t seem very significant. That said, given the limited amount of data, there was a fair degree of variance.
+
+
+Reply
+
+React
+Fae Gaze
+Posted 9 months ago
+
+· 343rd in this Competition
+
+Thanks for clarifying, Jack! Small datasets always add some randomness. Still, it’s impressive how close your CV and leaderboard results ended up.
+
+
+Reply
+
+React
+Bilzard
+Posted 10 months ago
+
+· 42nd in this Competition
+
+@rsakata Congrats for solo prize winner.
+
+This approach is prone to label error of handedness. Some participant reported NaN in demographic column, and if it is true, it affect LB performance of this approach.
+https://www.kaggle.com/competitions/cmi-detect-behavior-with-sensor-data/discussion/603543
+
+Also, missing rotation column in test can harm this approach.
+
+Do you handle specific care for these cases?
+
+
+Reply
+
+React
+Jack (Japan)
+Topic Author
+Posted 10 months ago
+
+· 6th in this Competition
+
+Thank you for your comment. You’re absolutely right — labeling errors in handedness would have a major impact. Ideally, this too should be determined by a classification model.
+
+Although I didn’t mention it explicitly in the write-up, I did take measures to handle missing rot values. My model outputs predictions for each feature block, so I implemented a conditional branch: if both tof and rot have more than 50% missing values, the prediction from the acc block is used instead.
+
+
+Reply
+
+React
+Bilzard
+Posted 10 months ago
+
+· 42nd in this Competition
+
+smart measure. thanks.
+
+
+Reply
+
+React
+Fnoa
+Posted 10 months ago
+
+· 9th in this Competition
+
+Great solution! congrats
+
+
+Reply
+
+React
+minerppdy
+Posted 10 months ago
+
+· 3rd in this Competition
+
+Great work. We did the same flip with left-handedness subjects and incorrect wearing subjects. I also used a model try to detect incorrect wearing subjects. But after probing, I didn't find any incorrect wearing subjects at LB, weird.
+
+
+Reply
+
+React
+greySnow
+Posted 10 months ago
+
+· 18th in this Competition
+
+Check my replay below
+
+
+Reply
+
+React
+XuKong Ji
+Posted 10 months ago
+
+· 151st in this Competition
+
+Good observation for data handness and rotate, That balanced my fold score.
+
+
+Reply
+
+React
+MJeremy
+Posted 10 months ago
+
+· 293rd in this Competition
+
+thanks for sharing! I also inspected your code and I am still quite amazed of how you come up with such a structure, some questions
+
+your conv layers put normalization after activation, is it wrong or intentional?
+after conv layres, you used the segment average pooling, did you consider LSTM or GRU where every body else is using? Why you decided to not go with it?
+quite amazed at the NN structure, how did you come up with such a complex structure, is there any reference or just step-by-step trial & error?
+
+Reply
+
+React
+Jack (Japan)
+Topic Author
+Posted 10 months ago
+
+· 6th in this Competition
+
+Thank you for your comment!
+
+I know the typical order is Conv → BN → ReLU, and I initially followed that. However, when I swapped BN and ReLU, the accuracy improved, so I adopted that arrangement. I don’t know why, though — I’ve never encountered this before, so it might have just happened to work better with this dataset.
+I also tried LSTM and attention pooling instead of gesture/non-gesture pooling, but they didn’t show any improvement.
+There was no reference; the structure was the result of repeated trial and error.
+
+Reply
+
+React
+Muhammad Hamza
+Posted 10 months ago
+
+I am also face null results due to label handedness this is too irritating phase when you see them 😂Great Solution!
+
+
+Reply
+
+React
+Optimo
+Posted 10 months ago
+
+· 17th in this Competition
+
+upside detector + UNet gesture features is brilliant! Congrats!
+
+
+Reply
+
+React
+Fae Gaze
+Posted 9 months ago
+
+· 343rd in this Competition
+
+Thanks again for sharing this. great work, Jack!
+One question — do you think your orientation and handedness fixes were more important for improving CV stability, or for closing the public/private gap?

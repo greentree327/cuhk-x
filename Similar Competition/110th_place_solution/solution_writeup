@@ -1,0 +1,17 @@
+Solution
+We observed that different behaviors lead to different results depending on the phase. This suggests that carefully manipulating the signal during a significant phase could be highly beneficial, as the phase plays a critical role in determining the outcome.
+
+Quaternion error:
+quaternion error
+
+Gravity accel error:
+gravity accel error
+
+Then it turns out that we find a good library to handle this type of signal, using ATAR algorithm in spkit to process the signal in each phase, and boost cv and lb.
+
+Here are the result using different parameter in ATAR on acceleration:
+
+
+We also try to use Faiss to retrieve similar signal and use them in the inference, just miss to use subject which is really important in this competition.
+
+Will fill up more later.

@@ -1,0 +1,158 @@
+Overview
+2D CNN Approach: I converted the time-series data into images and processed them using either EfficientNet or ConvNeXt.
+Hierarchical Multi-task Learning: The model has a main 9-class classification task and three auxiliary tasks (a detailed 18-class classification, orientation, and behavior).
+The behavior is predicted as a time series from the backbone's intermediate feature maps. This prediction is then used as an additional feature for the main and other auxiliary classification tasks.
+Exponential Moving Average (EMA): Used for more stable training.
+Data Augmentation: I used a variety of augmentations, including time-series specific ones (like Time Warping) and Mixup that was only applied between samples of the same orientation.
+Post-processing: A final step was applied to ensure that each subject in the test set had an equal number of assigned classes.
+Preprocessing
+IMU Data (12 dims → 41 dims)
+Base Features: acc (3), rot (4), thm (5).
+Engineered Features:
+Linear acceleration after removing gravity (calculated using quaternions).
+Angular velocity and angular distance.
+Jerk (the derivative of acceleration) and its magnitude.
+Frequency domain features (power in the 0-1Hz, 1-5Hz, and 5-10Hz bands).
+Detection of direction changes (using cosine similarity between consecutive frames).
+Corrected for handedness by inverting specific axes.
+Normalized all features using StandardScaler.
+TOF Data (320 dims)
+The data structure was (seq_len, 5*64=320).
+Corrected for sensor rotation and left/right differences.
+I found that arranging the TOF sensor data to match their physical proximity improved accuracy. The best order was:
+TOF2 → TOF1 → TOF3 → TOF5 → TOF4
+Data Transformation
+Crop: Took the last 140 steps from each sequence.
+Resample: Resampled the 140 steps to 512 steps.
+Resize: Treated the resulting (512 steps, 361 channels) data as an image and resized it to (512, 1024) using cv2.resize.
+Model
+Architecture
+IMU only: ConvNeXt-base (pre-trained on ImageNet).
+IMU+THM+TOF: EfficientNet-B5 (pre-trained on ImageNet).
+Used multi-scale feature extraction from stages -1, -2, and -3 of the backbone.
+The model has multi-head outputs:
+Main Cls Head (9 classes)
+Auxiliary Cls Head (18 classes)
+Orientation Head (4 classes)
+Behavior Head (4 classes x 64 steps, temporal)
+The behavior prediction was generated as a 64-step time series from an intermediate feature map. The resulting 4-class probability values for each step were added as features for the main and other aux task.
+Others
+Data Augmentation
+Time-series Augmentations: Time Warping, Magnitude Warping, Jittering, Scaling, and Window Slicing.
+Mixup: Applied only between samples that shared the same orientation.
+Rotation Data Dropout: Randomly set quaternion features to zero with a 20% probability.
+Variable-length Cropping during Training: Used shorter sequences (70-200 steps) and longer sequences (120-700 steps) to handle variability.
+Training Configuration
+Optimizer: AdamW (lr=1e-3, weight_decay=1e-4)
+Batch Size: 32
+Scheduler: Cosine Annealing with a 150-step warm-up.
+EMA: decay=0.99.
+Post-processing
+I applied a post-processing step to equalize the number of predicted classes for each subject in the test set.
+I did not have time to implement a more complex version that also considered (subject, orientation).
+The score improvement from this post-processing was +0.004 CV, +0.01 Public LB, and +0.005 Private LB.
+CV	Public	Private
+Without postprocess (ensemble)	0.884	0.872	0.864
+With postprocess (ensemble)	0.888	0.882	0.869
+The CV score is calculated excluding SUBJ_045235 and SUBJ_019262.
+Author
+ishikei
+amanatsu
+
+
+Share
+Citation
+ishikei. 7th Place Solution. https://www.kaggle.com/competitions/cmi-detect-behavior-with-sensor-data/writeups/7th-place-solution. 2025. Kaggle
+
+
+React
+6 Comments
+Hotness
+ 
+Comment here. Be patient, be friendly, and focus on ideas. We're all here to learn and improve!
+This comment will be made public once posted.
+
+
+Post Comment
+Emily Agent by Hexo AI
+Posted 10 months ago
+
+· 558th in this Competition
+
+Hi ishikei,
+Thanks for the writeup. This is definitely a very elegant approach. Could you please elaborate on how you applied a post-processing step to equalize the number of predicted classes for each subject in the test set? Many thanks!
+
+
+Reply
+
+React
+greySnow
+Posted 10 months ago
+
+· 18th in this Competition
+
+Can you please elaborate, how you turn the 1D data to 2D images?
+
+
+Reply
+
+React
+ishikei
+Topic Author
+Posted 10 months ago
+
+· 7th in this Competition
+
+Simply concatenate IMU and TOF features along the feature_dim, and treat them as image data with ch_size=1.
+
+# imu.shape = (seq_len, imu_ch)
+# tof.shape = (seq_len, tof_ch)
+img = np.concatenate([imu, tof], axis=1) # (seq_len, imu_ch+tof_ch)
+img = cv2.resize(img, (1024, 512)) # (seq_len=512, feat_size=1024)
+img = img.reshape(1, 512, 1024) # (1, seq_len, feat_size) as (ch, h, w)
+
+Reply
+
+React
+Mauro Abidal Carrer
+Posted 10 months ago
+
+· 146th in this Competition
+
+Hello, congrats for reaching 7th place.
+What is the advantage of turning the channels into a spatial dimension?
+Does it mean that you have a single channel in the input?
+Do you leave the kernel size of your feature extractors to their original size?
+
+
+Reply
+
+React
+Kurise
+Posted 10 months ago
+
+· 100th in this Competition
+
+When I saw this competition, I also considered 1D to 2D data, but this way is a time-cost method so I gave up. Could you please reveal how many time will your training cost? @amanatsu And this method is what I considered about 1D to 2D, hoping this could be helpful! https://www.kaggle.com/competitions/birdclef-2024/discussion/511763
+
+
+Reply
+
+React
+Quan Vu
+Posted 10 months ago
+
+· 30th in this Competition
+
+Nice, I also participated in HMS challenge and only used pure computer vision models, and now in this competition, I am also using computer vision models. 😆
+
+
+Reply
+
+React
+MJeremy
+Posted 10 months ago
+
+· 293rd in this Competition
+
+Hi, @amanatsu cool solution, do you have code to share?
