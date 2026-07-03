@@ -14,6 +14,7 @@ Monitor:
     - Checkpoints:   output/<config>/fold_*/best_model.pth
     - Submissions:   output/<config>/submission.csv
 """
+import os
 import sys
 import time
 from pathlib import Path
@@ -24,7 +25,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from src.config import Config
 
 
-LOG_PATH = Path("output/run.log")
+# Overridable so checkpoints/logs can be redirected to persistent storage
+# (e.g. a Google Drive mount in Colab) without moving the code itself there.
+# Defaults to "output" (unchanged local behavior) when unset.
+OUTPUT_ROOT = Path(os.environ.get("CUHKX_OUTPUT_ROOT", "output"))
+LOG_PATH = OUTPUT_ROOT / "run.log"
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -108,7 +113,7 @@ def main():
     base = dict(epochs=60, n_folds=5, batch_size=16, num_workers=2, mixed_precision=True)
 
     c1 = Config()
-    c1.output_dir = Path("output/minimal")
+    c1.output_dir = OUTPUT_ROOT / "minimal"
     for a in ['use_synthesized_features','use_skeleton_attention_mask',
               'use_spatial_crop','use_random_erase','use_aux_category_loss',
               'use_class_weights']:
@@ -116,12 +121,12 @@ def main():
     for k, v in base.items(): setattr(c1, k, v)
 
     c2 = Config()
-    c2.output_dir = Path("output/baseline")
+    c2.output_dir = OUTPUT_ROOT / "baseline"
     for k, v in base.items(): setattr(c2, k, v)
 
     c3 = Config()
     c3.flags.use_synthesized_features = True
-    c3.output_dir = Path("output/synthesized")
+    c3.output_dir = OUTPUT_ROOT / "synthesized"
     for k, v in base.items(): setattr(c3, k, v)
 
     results = {}
@@ -139,7 +144,7 @@ def main():
     log(f"  SUMMARY — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} — {el/60:.0f} min total")
     log(f"{'='*70}")
     for l, a in results.items():
-        sub = Path(f"output/{l}/submission.csv")
+        sub = OUTPUT_ROOT / l / "submission.csv"
         log(f"  {l:15s}  {'FAILED' if a is None else f'{a:.2f}%':>8s}  {sub if sub.exists() else 'N/A'}")
     log(f"{'='*70}")
     log(f"\nFull log: {LOG_PATH.resolve()}")

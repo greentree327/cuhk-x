@@ -110,9 +110,15 @@ class Trainer:
         self.fold_dir = config.output_dir / f"fold_{fold}"
         self.fold_dir.mkdir(parents=True, exist_ok=True)
         self.best_model_path = self.fold_dir / "best_model.pth"
+        self.last_checkpoint_path = self.fold_dir / "last_checkpoint.pth"
 
         # Metrics
         self.best_acc = 0.0
+
+        # Resume from a previous interrupted run for this fold, if present.
+        # Must run after model/optimizer/scheduler/scaler/ema/early_stopping
+        # are all constructed above, since it overwrites their state.
+        self.start_epoch = self._try_resume()
 
     @staticmethod
     def _compute_class_weights(clip_list, num_classes):
@@ -145,6 +151,59 @@ class Trainer:
         # Normalize so mean weight = 1
         weights = weights / weights.mean()
         return torch.from_numpy(weights).float()
+
+    def _try_resume(self):
+        """Load full training state from a previous interrupted run of this fold.
+
+        Ephemeral environments (Colab, spot instances) can kill a run mid-fold
+        long before it finishes. Re-running the same script re-instantiates
+        this Trainer, which then picks up from the last epoch that finished,
+        instead of restarting the fold from scratch.
+
+        Returns:
+            int: epoch index to resume training from (0 if no checkpoint).
+        """
+        if not self.last_checkpoint_path.exists():
+            return 0
+
+        ckpt = torch.load(self.last_checkpoint_path, map_location=self.device,
+                          weights_only=False)
+        self.model.load_state_dict(ckpt["model_state_dict"])
+        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        self.scaler.load_state_dict(ckpt["scaler_state_dict"])
+        self.ema.shadow = {k: v.to(self.device) for k, v in ckpt["ema_shadow"].items()}
+        self.early_stopping.best_score = ckpt["early_stopping_best_score"]
+        self.early_stopping.counter = ckpt["early_stopping_counter"]
+        self.early_stopping.early_stop = ckpt["early_stopping_early_stop"]
+        self.best_acc = ckpt["best_acc"]
+
+        resume_epoch = ckpt["epoch"] + 1
+        print(f"  Resuming fold {self.fold + 1} from epoch {resume_epoch + 1} "
+              f"(best acc so far: {self.best_acc:.2f}%)")
+        return resume_epoch
+
+    def _save_resume_checkpoint(self, epoch):
+        """Save full training state so this fold can resume after an
+        interruption without losing already-completed epochs.
+
+        Distinct from _save_checkpoint's best-only model weights (which
+        inference.py loads for eval) — this includes optimizer/scheduler/
+        scaler/EMA/early-stopping state and is overwritten every epoch.
+        """
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict(),
+            "ema_shadow": self.ema.shadow,
+            "early_stopping_best_score": self.early_stopping.best_score,
+            "early_stopping_counter": self.early_stopping.counter,
+            "early_stopping_early_stop": self.early_stopping.early_stop,
+            "best_acc": self.best_acc,
+        }
+        torch.save(checkpoint, self.last_checkpoint_path)
 
     def train_epoch(self):
         """Run one training epoch.
@@ -256,7 +315,13 @@ class Trainer:
         print(f"  Params: {self.model.get_parameter_count():.1f}M")
         print(f"{'='*60}\n")
 
-        for epoch in range(self.config.epochs):
+        # Resumed from a checkpoint that already finished this fold (either
+        # ran out its full epoch budget, or early-stopped) — nothing to do.
+        if self.early_stopping.early_stop or self.start_epoch >= self.config.epochs:
+            print(f"  Fold {self.fold + 1} already complete. Best Val Acc: {self.best_acc:.2f}%\n")
+            return self.best_acc
+
+        for epoch in range(self.start_epoch, self.config.epochs):
             start_time = time.time()
 
             # Train
@@ -285,6 +350,10 @@ class Trainer:
                 self.best_acc = val_acc
                 self._save_checkpoint(epoch, val_acc, is_best=True)
                 print(f"  -> New best! Saved to {self.best_model_path}")
+
+            # Full resume state, saved every epoch regardless of is_best, so
+            # an interruption never costs more than one epoch of progress.
+            self._save_resume_checkpoint(epoch)
 
             if self.early_stopping.early_stop:
                 print(f"  -> Early stopping at epoch {epoch+1}")
