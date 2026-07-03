@@ -86,19 +86,41 @@ def ensure_dataset_available(config, raw_dir=None):
         )
 
     _download_repo(raw_dir, token)
-    _ensure_zip_cli()
 
     zip_groups = _find_zip_groups(raw_dir)
     print(f"[data_bootstrap] Found archive groups: "
           f"{ {k: [p.name for p in v] for k, v in zip_groups.items()} }")
 
-    for base_name, parts in zip_groups.items():
+    # Process smallest archive group(s) first so their disk usage is freed
+    # before committing to the largest group's reassemble+extract peak
+    # (zip + its extracted output coexisting is the single biggest moment
+    # of disk pressure — better to hit it with nothing else outstanding).
+    ordered_groups = sorted(
+        zip_groups.items(),
+        key=lambda kv: sum(p.stat().st_size for p in kv[1]),
+    )
+
+    for base_name, parts in ordered_groups:
         full_zip = _reassemble_if_split(raw_dir, base_name, parts)
         extract_scratch = raw_dir / f"_extract_{base_name}"
         extract_scratch.mkdir(exist_ok=True)
         print(f"[data_bootstrap] Extracting {full_zip.name} -> {extract_scratch}")
         _extract_zip(full_zip, extract_scratch)
+
+        # Free the archive immediately after extraction — a ~40GB zip sitting
+        # next to its own ~40GB extracted output is the other half of the
+        # disk-bloat problem (the first half being the split parts, already
+        # freed in _reassemble_if_split).
+        full_zip.unlink()
+        print(f"[data_bootstrap] Freed {full_zip.name} after extraction")
+
         _place_extracted(extract_scratch, config)
+
+        # Whatever's left is either empty wrapper dirs (the real content was
+        # moved out by _place_extracted) or something detection missed —
+        # either way it's not needed once is_dataset_ready() is re-checked
+        # below, so don't let it linger and eat disk across retries.
+        shutil.rmtree(extract_scratch, ignore_errors=True)
 
     if not is_dataset_ready(config):
         raise RuntimeError(
@@ -109,6 +131,10 @@ def ensure_dataset_available(config, raw_dir=None):
             "actually downloaded/extracted and adjust _place_extracted()."
         )
 
+    # Nothing under raw_dir is needed anymore — the actual data now lives at
+    # config.train_data / config.test_data. Reclaim the rest (leftover HF
+    # metadata files, .gitattributes, etc.) rather than leaving it to rot.
+    shutil.rmtree(raw_dir, ignore_errors=True)
     print("[data_bootstrap] Dataset ready.")
 
 
@@ -182,6 +208,7 @@ def _reassemble_if_split(raw_dir, base_name, parts):
     if len(parts) == 1:
         return parts[0]
 
+    _ensure_zip_cli()
     main_zip = next(p for p in parts if p.suffix.lower() == ".zip")
     full_zip = raw_dir / f"{base_name}_full.zip"
     if full_zip.exists():
@@ -194,6 +221,14 @@ def _reassemble_if_split(raw_dir, base_name, parts):
         ["zip", "-s", "0", str(main_zip), "--out", str(full_zip)],
         check=True, cwd=str(raw_dir),
     )
+
+    # Free the split volumes immediately — with a ~40GB archive, keeping
+    # both the parts and the reassembled copy around at once is exactly
+    # what fills a Colab disk (parts + full_zip + extracted output would
+    # otherwise all coexist).
+    for part in parts:
+        part.unlink()
+    print(f"[data_bootstrap] Freed {len(parts)} split volumes after reassembly")
     return full_zip
 
 
