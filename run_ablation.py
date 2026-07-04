@@ -41,6 +41,13 @@ def _env_int(name, default):
     return int(val) if val else default
 
 
+def _env_bool(name, default):
+    """Same empty-string-means-unset handling as _env_str, parsed as a
+    0/1 flag (e.g. CUHKX_CROSS_MODAL_ATTENTION=1)."""
+    val = _env_str(name, "")
+    return bool(int(val)) if val else default
+
+
 # Overridable so checkpoints/logs can be redirected to persistent storage
 # (e.g. a Google Drive mount in Colab) without moving the code itself there.
 # Defaults to "output" (unchanged local behavior) when unset.
@@ -74,6 +81,8 @@ def run_config(label, cfg):
     log(f"  synth={cfg.flags.use_synthesized_features} mask={cfg.flags.use_skeleton_attention_mask} "
         f"crop={cfg.flags.use_spatial_crop} erase={cfg.flags.use_random_erase}")
     log(f"  aux={cfg.flags.use_aux_category_loss} cls_wt={cfg.flags.use_class_weights}")
+    log(f"  seg_pool={cfg.flags.use_segment_pooling} cross_attn={cfg.flags.use_cross_modal_attention} "
+        f"hflip={cfg.flags.use_handedness_flip}")
     log(f"  imu_dim={cfg.imu_input_dim} skel_dim={cfg.skel_input_dim} "
         f"epochs={cfg.epochs} folds={cfg.n_folds} batch={cfg.batch_size}")
     log(f"{'#'*70}")
@@ -161,6 +170,19 @@ def main():
     c3.flags.use_synthesized_features = True
     c3.output_dir = OUTPUT_ROOT / "synthesized"
     for k, v in base.items(): setattr(c3, k, v)
+
+    # Architecture/augmentation flags default to whatever each config above
+    # already set (usually the FeatureFlags dataclass default), but are
+    # overridable per-run via env vars — same empty-string-means-unset
+    # convention as epochs/n_folds — so a Colab run can flip them on
+    # without editing this file (e.g. CUHKX_CROSS_MODAL_ATTENTION=1).
+    for cfg in (c1, c2, c3):
+        cfg.flags.use_segment_pooling = _env_bool(
+            "CUHKX_SEGMENT_POOLING", cfg.flags.use_segment_pooling)
+        cfg.flags.use_cross_modal_attention = _env_bool(
+            "CUHKX_CROSS_MODAL_ATTENTION", cfg.flags.use_cross_modal_attention)
+        cfg.flags.use_handedness_flip = _env_bool(
+            "CUHKX_HANDEDNESS_FLIP", cfg.flags.use_handedness_flip)
 
     # Which configs to run is also overridable, so a calibration run can
     # target just one (e.g. CUHKX_CONFIGS=minimal) instead of all three.
