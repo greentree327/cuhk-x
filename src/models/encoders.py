@@ -194,18 +194,26 @@ class FrameEncoder(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-    def forward(self, frames):
+    def forward(self, frames, return_sequence=False):
         """Forward pass.
 
         Args:
             frames: (batch, N_frames, C, H, W) float tensor.
                    C=3 for Depth_Color/Thermal, C=1 for IR.
+            return_sequence: if True, return the pre-pooling per-frame
+                sequence (B, N, encoder_dim) instead of pooling it here —
+                used by HARModel when Depth_Color/IR/Thermal need to run
+                through TimeAlignedFrameCrossAttention before pooling.
+                Call pool_sequence() separately afterward in that case.
 
         Returns:
-            (batch, pool_out_dim) embedding.
-            Returns zero tensor of correct shape if frames is empty.
+            (batch, pool_out_dim) embedding, or (batch, N, encoder_dim) if
+            return_sequence=True. Returns a zero tensor of the appropriate
+            shape if frames is empty.
         """
         if frames.numel() == 0:
+            if return_sequence:
+                return torch.zeros(0, 0, self.encoder_dim, device=frames.device)
             return torch.zeros(0, self.pool_out_dim, device=frames.device)
 
         B, N, C, H, W = frames.shape
@@ -218,11 +226,30 @@ class FrameEncoder(nn.Module):
         x = self.head(x)        # (B*N, encoder_dim)
         x = x.view(B, N, -1)    # (B, N, encoder_dim)
 
-        # Temporal attention pooling
-        mask = torch.ones(B, N, device=frames.device)
-        pooled = self.pool(x, mask)
+        if return_sequence:
+            return x
 
-        return pooled
+        return self.pool_sequence(x)
+
+    def pool_sequence(self, x, mask=None):
+        """Apply this encoder's own temporal pooling to a per-frame
+        sequence — split out from forward() so a sequence that went
+        through TimeAlignedFrameCrossAttention first (or any other
+        pre-pooling processing) can still use this encoder's own pooling
+        head afterward.
+
+        Args:
+            x: (batch, N, encoder_dim) per-frame embeddings.
+            mask: (batch, N) float mask, or None to treat every frame as
+                valid (this encoder never tracks true per-clip frame
+                counts — see FrameEncoder's docstring).
+
+        Returns:
+            (batch, pool_out_dim) embedding.
+        """
+        if mask is None:
+            mask = torch.ones(x.shape[0], x.shape[1], device=x.device)
+        return self.pool(x, mask)
 
 
 class RadarEncoder(nn.Module):

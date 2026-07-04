@@ -35,6 +35,7 @@ class FeatureFlags:
 
     # -- Fusion architecture --
     use_cross_modal_attention: bool = False    # let modality embeddings attend to each other before fusion (CMI 1st place pattern), instead of pure late-fusion concat
+    use_time_aligned_frame_attention: bool = False  # per-timestep cross-attention between Depth_Color/IR/Thermal at matching real-world time positions, before temporal pooling (closer to CMI's actual pre-pooling pattern than use_cross_modal_attention's post-pooling approximation) — scoped to these 3 modalities only since they're the only ones with an exact, non-approximate frame-rate ratio (16:16:32)
 
     # -- Auxiliary supervision --
     use_aux_category_loss: bool = True         # coarse 8-category auxiliary classifier

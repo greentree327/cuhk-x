@@ -308,3 +308,110 @@ class CrossModalFusion(nn.Module):
         ff_out = self.ff(x)
         x = self.norm2(x + ff_out)
         return x
+
+
+class TimeAlignedFrameCrossAttention(nn.Module):
+    """Cross-attention between Depth_Color, IR, and Thermal at matching
+    real-world time positions, applied to each modality's per-frame
+    sequence BEFORE its own temporal pooling collapses time away — this is
+    the actual CMI 1st place pattern (see public_solution_ogurtsov's
+    IMUCrossAttentionFusion, which cross-attends (B, T, C) sequences with T
+    intact), as opposed to CrossModalFusion in this same file, which only
+    attends over already-pooled single vectors and is a shallower
+    approximation of it.
+
+    This exact time alignment is only possible for these 3 modalities:
+    Depth_Color and IR both uniformly sample config.num_frames frames
+    across the clip; Thermal uniformly samples config.num_thermal_frames =
+    2 * num_frames frames across the *same* clip (native fps is ~2.5x, but
+    the sampled counts land on an exact 2:1 ratio) — so Depth_Color[i] and
+    IR[i] represent the same instant Thermal[2i] and Thermal[2i+1]
+    straddle. IMU/Radar/Skeleton don't share a common divisor fine enough
+    to align this way (deliberately out of scope here — see the ablation
+    flag name).
+
+    Each time-bin's group of exactly 4 embeddings (1 depth + 1 ir + 2
+    thermal) attends only within itself, not across bins — vectorized as
+    one batched attention call over an effective batch of batch*num_bins.
+
+    Missing modalities are masked out of the attention's key/value side
+    (nn.MultiheadAttention's key_padding_mask) so a sample missing e.g.
+    Depth_Color doesn't let IR/Thermal attend to its zero-filled frames —
+    unlike CrossModalFusion's post-pooling case (where missing-modality
+    substitution already happened before it ever runs), this module
+    operates on raw per-frame CNN output, which has no such substitution
+    yet, so it needs its own masking.
+    """
+
+    def __init__(self, embed_dim, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 2, embed_dim),
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+
+    def forward(self, depth_seq, ir_seq, thermal_seq, has_depth, has_ir, has_thermal):
+        """
+        Args:
+            depth_seq: (B, N, D) per-frame Depth_Color embeddings (pre-pool).
+            ir_seq: (B, N, D) per-frame IR embeddings (pre-pool).
+            thermal_seq: (B, 2N, D) per-frame Thermal embeddings (pre-pool).
+            has_depth, has_ir, has_thermal: (B,) float or bool presence flags.
+
+        Returns:
+            (depth_enhanced, ir_enhanced, thermal_enhanced), same shapes
+            as the corresponding inputs.
+        """
+        B, N, D = depth_seq.shape
+
+        # Group into (B, N, 4, D): depth, ir, thermal[2i], thermal[2i+1].
+        thermal_pairs = thermal_seq.view(B, N, 2, D)
+        group = torch.cat([
+            depth_seq.unsqueeze(2),   # (B, N, 1, D)
+            ir_seq.unsqueeze(2),      # (B, N, 1, D)
+            thermal_pairs,            # (B, N, 2, D)
+        ], dim=2)                     # (B, N, 4, D)
+
+        # Flatten batch*time-bins into one effective batch dimension so a
+        # single batched attention call handles all N bins at once, rather
+        # than looping over bins in Python.
+        group_flat = group.reshape(B * N, 4, D)
+
+        # key_padding_mask convention: True = ignore this position. The
+        # same per-sample presence applies to every one of its N bins.
+        absent = torch.stack([
+            ~has_depth.bool(), ~has_ir.bool(), ~has_thermal.bool(), ~has_thermal.bool(),
+        ], dim=-1)                                          # (B, 4)
+        key_padding_mask = absent.unsqueeze(1).expand(B, N, 4).reshape(B * N, 4)
+
+        # Guard against an all-masked row (all 3 modalities missing at
+        # once for that sample): softmax over an entirely -inf row is
+        # undefined. Rare/unlikely given the dataset's ~95.9% all-present
+        # rate, but cheap insurance against NaN propagation regardless —
+        # unmask everything for those rows instead (their outputs get
+        # discarded downstream by the per-modality missing-token
+        # substitution anyway, same as the fully-empty-batch case
+        # elsewhere in this codebase).
+        fully_absent = key_padding_mask.all(dim=-1, keepdim=True)
+        key_padding_mask = key_padding_mask & ~fully_absent
+
+        attn_out, _ = self.attn(
+            group_flat, group_flat, group_flat, key_padding_mask=key_padding_mask
+        )
+        x = self.norm1(group_flat + attn_out)
+        ff_out = self.ff(x)
+        x = self.norm2(x + ff_out)   # (B*N, 4, D)
+
+        x = x.view(B, N, 4, D)
+        depth_enhanced = x[:, :, 0, :]
+        ir_enhanced = x[:, :, 1, :]
+        thermal_enhanced = x[:, :, 2:4, :].reshape(B, N * 2, D)
+
+        return depth_enhanced, ir_enhanced, thermal_enhanced

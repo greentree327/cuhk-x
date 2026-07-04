@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from .encoders import IMUEncoder, FrameEncoder, RadarEncoder, SkeletonEncoder
-from layers import CrossModalFusion
+from layers import CrossModalFusion, TimeAlignedFrameCrossAttention
 
 
 class FusionHead(nn.Module):
@@ -178,6 +178,17 @@ class HARModel(nn.Module):
         # to know this to size their layers correctly.
         effective_dim = self.imu_encoder.pool_out_dim
 
+        # Time-aligned cross-attention between Depth_Color/IR/Thermal, run
+        # on their pre-pooling per-frame sequences (always enc_dim-wide,
+        # regardless of segment pooling — that only affects the output
+        # *after* pooling). See TimeAlignedFrameCrossAttention's docstring
+        # for why only these 3 modalities support this exact alignment.
+        self.use_time_aligned_frame_attention = config.flags.use_time_aligned_frame_attention
+        if self.use_time_aligned_frame_attention:
+            self.frame_cross_attn = TimeAlignedFrameCrossAttention(
+                enc_dim, num_heads=4, dropout=config.dropout
+            )
+
         # Fusion
         self.fusion = FusionHead(
             num_modalities=6, encoder_dim=effective_dim,
@@ -227,26 +238,36 @@ class HARModel(nn.Module):
             emb = torch.empty(0)
         embeddings.append(emb)
 
-        # Depth_Color
-        if batch["depth_color"].numel() > 0:
-            emb = self.depth_encoder(batch["depth_color"])
+        # Depth_Color / IR / Thermal: if time-aligned cross-attention is on,
+        # get each modality's pre-pooling per-frame sequence, cross-attend
+        # them at matching real-world time positions, then pool each
+        # modality's own (now cross-modally-enhanced) sequence. Otherwise,
+        # each encoder pools independently as before.
+        if (self.use_time_aligned_frame_attention
+                and batch["depth_color"].numel() > 0
+                and batch["ir"].numel() > 0
+                and batch["thermal"].numel() > 0):
+            depth_seq = self.depth_encoder(batch["depth_color"], return_sequence=True)
+            ir_seq = self.ir_encoder(batch["ir"], return_sequence=True)
+            thermal_seq = self.thermal_encoder(batch["thermal"], return_sequence=True)
+            depth_seq, ir_seq, thermal_seq = self.frame_cross_attn(
+                depth_seq, ir_seq, thermal_seq,
+                flags["has_depth"], flags["has_ir"], flags["has_thermal"],
+            )
+            depth_emb = self.depth_encoder.pool_sequence(depth_seq)
+            ir_emb = self.ir_encoder.pool_sequence(ir_seq)
+            thermal_emb = self.thermal_encoder.pool_sequence(thermal_seq)
         else:
-            emb = torch.empty(0)
-        embeddings.append(emb)
+            depth_emb = (self.depth_encoder(batch["depth_color"])
+                         if batch["depth_color"].numel() > 0 else torch.empty(0))
+            ir_emb = (self.ir_encoder(batch["ir"])
+                      if batch["ir"].numel() > 0 else torch.empty(0))
+            thermal_emb = (self.thermal_encoder(batch["thermal"])
+                           if batch["thermal"].numel() > 0 else torch.empty(0))
 
-        # IR
-        if batch["ir"].numel() > 0:
-            emb = self.ir_encoder(batch["ir"])
-        else:
-            emb = torch.empty(0)
-        embeddings.append(emb)
-
-        # Thermal
-        if batch["thermal"].numel() > 0:
-            emb = self.thermal_encoder(batch["thermal"])
-        else:
-            emb = torch.empty(0)
-        embeddings.append(emb)
+        embeddings.append(depth_emb)
+        embeddings.append(ir_emb)
+        embeddings.append(thermal_emb)
 
         # Build flags tensor: [has_imu, has_radar, has_skeleton, has_depth, has_ir, has_thermal]
         flag_tensor = torch.stack([
@@ -298,6 +319,8 @@ class HARModel(nn.Module):
             "fusion": self.fusion,
             "aux_head": self.aux_head,
         }
+        if self.use_time_aligned_frame_attention:
+            components["frame_cross_attn"] = self.frame_cross_attn
         total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
 
         breakdown = {}
@@ -322,6 +345,7 @@ class HARModel(nn.Module):
             name for name, on in [
                 ("segment_pooling", self.config.flags.use_segment_pooling),
                 ("cross_modal_attention", self.config.flags.use_cross_modal_attention),
+                ("time_aligned_frame_attention", self.use_time_aligned_frame_attention),
                 ("synthesized_features", self.config.flags.use_synthesized_features),
             ] if on
         ]
