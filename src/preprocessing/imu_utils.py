@@ -396,17 +396,28 @@ def process_imu_trial(file_paths, target_seq_len=128, time_delta=1 / 20,
     COL_GYRO = ['角速度X(°/s)', '角速度Y(°/s)', '角速度Z(°/s)']
     COL_QUAT = ['四元数0()', '四元数1()', '四元数2()', '四元数3()']
 
-    # Load and merge CSVs
+    # Load and merge CSVs. A handful of real trials have one (or both) CSV
+    # genuinely empty (0 rows) — dropped here rather than handed to
+    # pd.concat, which otherwise raises a FutureWarning about empty/all-NA
+    # entries and, more importantly, would let an empty frame's dtypes
+    # influence the concat result under a future pandas version.
     frames = []
     for fp in file_paths:
         df = pd.read_csv(fp)
+        if df.empty:
+            continue
         df[COL_TIME] = pd.to_datetime(df[COL_TIME])
         frames.append(df)
+
+    feat_per_sensor = 27 if use_synthesized else 10
+    total_feat = feat_per_sensor * IMU_NUM_SENSORS  # 135 or 50
+
+    if not frames:
+        return torch.zeros(target_seq_len, total_feat, dtype=torch.float32)
+
     merged = pd.concat(frames, ignore_index=True).sort_values(COL_TIME)
 
     # Process each sensor independently, then concatenate
-    feat_per_sensor = 27 if use_synthesized else 10
-    total_feat = feat_per_sensor * IMU_NUM_SENSORS  # 135 or 50
 
     if not mirror:
         sensor_features = []
