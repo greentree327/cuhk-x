@@ -36,6 +36,12 @@ class FeatureFlags:
     # -- Fusion architecture --
     use_cross_modal_attention: bool = False    # let modality embeddings attend to each other before fusion (CMI 1st place pattern), instead of pure late-fusion concat
 
+    # -- Handedness-flip augmentation (CMI 1st place "handedness normalization"
+    # pattern, ported from a deterministic per-subject correction into a
+    # random on-the-fly augmentation) --
+    use_handedness_flip: bool = False          # mirror all modalities left<->right per sample at train time
+    handedness_flip_p: float = 0.5             # probability of applying the flip to a given training sample
+
     # -- Auxiliary supervision --
     use_aux_category_loss: bool = True         # coarse 8-category auxiliary classifier
     aux_loss_weight: float = 0.2               # weight of auxiliary loss in total

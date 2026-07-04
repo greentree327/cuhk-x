@@ -30,6 +30,25 @@ MAX_IMU_SAMPLES = 50000
 MAX_RADAR_FRAMES = 4096
 MAX_SKEL_FRAMES = 4096
 
+# Left/right joint swap pairs for handedness-flip mirroring, verified from
+# this codebase's own angle_joints convention below (NOT generic H36M
+# literature — this pipeline's own labeling has 11=right_shoulder /
+# 14=left_shoulder, the reverse of the "standard" H36M convention, but
+# internal consistency is what a mirror-swap needs). Joints 0 (hip/pelvis
+# center), 7/8/9/10 (spine/neck/head chain) have no left/right counterpart
+# and are left in place.
+_SKEL_LR_SWAP_PAIRS = [(1, 4), (2, 5), (3, 6), (11, 14), (12, 15), (13, 16)]
+
+
+def _skeleton_mirror_permutation():
+    perm = list(range(17))
+    for a, b in _SKEL_LR_SWAP_PAIRS:
+        perm[a], perm[b] = perm[b], perm[a]
+    return perm
+
+
+SKEL_MIRROR_PERM = _skeleton_mirror_permutation()
+
 
 def parse_user_id(user_folder_name):
     """Extract numeric user ID from folder name like 'user10'.
@@ -186,17 +205,28 @@ class HARDataset(Dataset):
                 and "Skeleton" in modalities):
             spatial_mask = self._compute_skeleton_mask(modalities)
 
+        # Handedness-flip augmentation: one random decision per sample,
+        # applied consistently across every modality (CMI 1st place's
+        # "handedness normalization" pattern, ported from a deterministic
+        # per-subject correction into a random on-the-fly augmentation).
+        # Train-only, same convention as spatial_crop/random_erase below.
+        do_flip = (
+            self.is_train
+            and self.config.flags.use_handedness_flip
+            and np.random.rand() < self.config.flags.handedness_flip_p
+        )
+
         # Load each modality. Loaders always return a fixed-shape zero
         # placeholder when a modality is missing or fails to parse — never a
         # truly empty tensor — so every sample in a batch has identical shape
         # per modality and collate_fn can stack without dropping rows (which
         # would desync the batch from labels/flags).
-        sample["imu"] = self._load_imu(modalities)
-        sample["radar"] = self._load_radar(modalities)
-        sample["skeleton"] = self._load_skeleton(modalities)
-        sample["depth_color"] = self._load_frames(modalities, "Depth_Color", spatial_mask)
-        sample["ir"] = self._load_frames(modalities, "IR", spatial_mask)
-        sample["thermal"] = self._load_frames(modalities, "Thermal", spatial_mask)
+        sample["imu"] = self._load_imu(modalities, mirror=do_flip)
+        sample["radar"] = self._load_radar(modalities, mirror=do_flip)
+        sample["skeleton"] = self._load_skeleton(modalities, mirror=do_flip)
+        sample["depth_color"] = self._load_frames(modalities, "Depth_Color", spatial_mask, mirror=do_flip)
+        sample["ir"] = self._load_frames(modalities, "IR", spatial_mask, mirror=do_flip)
+        sample["thermal"] = self._load_frames(modalities, "Thermal", spatial_mask, mirror=do_flip)
 
         # Modality presence flags: based on directory presence, not tensor
         # emptiness (loaders never return empty tensors — see above).
@@ -308,7 +338,7 @@ class HARDataset(Dataset):
 
     # ---- Real data loaders (EDA-informed) ----
 
-    def _load_imu(self, modalities):
+    def _load_imu(self, modalities, mirror=False):
         """Load and preprocess IMU CSV data from 2 files (5 body sensors).
 
         CUHK-X IMU: 2 CSVs per trial.
@@ -317,6 +347,11 @@ class HARDataset(Dataset):
 
         Features extracted per sensor (19 dims):
           acc_ms2(3), rot_6d(6), gyro_rad(3), linear_acc(3), jerk(3), acc_mag(1)
+
+        Args:
+            modalities: dict of modality → file list.
+            mirror: if True, apply handedness-flip mirroring (see
+                preprocessing.imu_utils.process_imu_trial).
 
         Returns:
             (imu_seq_len, 95) float tensor (19 feat × 5 sensors),
@@ -334,18 +369,26 @@ class HARDataset(Dataset):
                 target_seq_len=self.config.imu_seq_len,
                 time_delta=1.0 / self.config.imu_target_hz,
                 use_synthesized=self.config.flags.use_synthesized_features,
+                mirror=mirror,
             )
         except Exception:
             return torch.zeros(self.config.imu_seq_len, self.config.imu_input_dim,
                                dtype=torch.float32)
 
-    def _load_radar(self, modalities):
+    def _load_radar(self, modalities, mirror=False):
         """Load radar point cloud CSV.
 
         CUHK-X Radar: 1 CSV per trial, ~82 frames, ~267 detections.
         Columns: timestamp, frame, DetObj#, x, y, z, v, snr, noise
 
         Groups by frame, pads each frame to max_points (64).
+
+        Args:
+            modalities: dict of modality → file list.
+            mirror: if True, negate the lateral x-coordinate (handedness
+                flip). Doppler velocity v is a radial (line-of-sight)
+                scalar, invariant under this reflection — |point| is
+                unchanged since (-x)^2 = x^2 — so only x is negated.
 
         Returns:
             (radar_seq_len, max_points, 6) float tensor,
@@ -368,6 +411,9 @@ class HARDataset(Dataset):
 
             for frame_id, grp in df.groupby("frame"):
                 pts = grp[feat_cols].values.astype(np.float32)
+                if mirror:
+                    pts = pts.copy()
+                    pts[:, 0] = -pts[:, 0]
                 # Pad/truncate to max_points
                 if pts.shape[0] < max_pts:
                     pad = np.zeros((max_pts - pts.shape[0], len(feat_cols)),
@@ -389,7 +435,7 @@ class HARDataset(Dataset):
             return torch.zeros(self.config.radar_seq_len, self.config.radar_max_points,
                                self.config.radar_point_dim, dtype=torch.float32)
 
-    def _load_skeleton(self, modalities):
+    def _load_skeleton(self, modalities, mirror=False):
         """Load skeleton keypoints and compute engineered features.
 
         CUHK-X Skeleton: ~42 JSONs in predictions/ subfolder.
@@ -399,6 +445,15 @@ class HARDataset(Dataset):
           - Joint positions (51): 17 joints × 3D, hip-centered, spine-normalized
           - Joint velocities (51): per-joint Δpos/Δt (CMI 3rd place pattern)
           - Bone angles (17): angle at each joint from connected bones
+
+        Args:
+            modalities: dict of modality → file list.
+            mirror: if True, apply handedness-flip mirroring: negate the
+                lateral x-coordinate and swap left/right joint pairs
+                (SKEL_MIRROR_PERM) before any hip-centering/normalization,
+                so the same downstream code (including the fixed
+                angle_joints indices below) operates on a physically
+                valid reflected pose.
 
         Returns:
             (skel_seq_len, 119) float tensor,
@@ -442,6 +497,10 @@ class HARDataset(Dataset):
                 return self._skeleton_fallback()
 
             kps_array = np.stack(keypoints_list, axis=0)  # (T, 17, 3)
+
+            if mirror:
+                kps_array = kps_array[:, SKEL_MIRROR_PERM, :].copy()
+                kps_array[:, :, 0] = -kps_array[:, :, 0]
 
             # Normalize: center on hip (joint 0), scale by spine length
             hip = kps_array[:, 0:1, :]  # (T, 1, 3)
@@ -519,7 +578,7 @@ class HARDataset(Dataset):
         """Expected skeleton feature dimension for current config."""
         return 119 if self.config.flags.use_synthesized_features else 51
 
-    def _load_frames(self, modalities, modality_name, spatial_mask=None):
+    def _load_frames(self, modalities, modality_name, spatial_mask=None, mirror=False):
         """Load and preprocess frame images for Depth_Color, IR, or Thermal.
 
         CUHK-X frame modalities:
@@ -536,12 +595,21 @@ class HARDataset(Dataset):
             modalities: dict of modality → file list.
             modality_name: "Depth_Color", "IR", or "Thermal".
             spatial_mask: (1, 1, F, F) float attention mask, or None.
+            mirror: if True, apply handedness-flip mirroring: horizontal
+                (left-right) flip of each frame. spatial_mask is flipped
+                the same way (once, up front) so it stays aligned with
+                the now-mirrored frame content — the mask was computed
+                from the un-mirrored skeleton bbox, so it must be flipped
+                to match.
 
         Returns:
             (N_frames, C, H, W) float tensor. C=3 for RGB, C=1 for IR.
             Returns a zero-filled tensor of the same shape if modality missing.
         """
         from PIL import Image
+
+        if mirror and spatial_mask is not None:
+            spatial_mask = torch.flip(spatial_mask, dims=[-1])
 
         # Determine in_channels and frame count (needed for both the
         # missing-modality placeholder and the real loading path)
@@ -609,6 +677,11 @@ class HARDataset(Dataset):
                     arr = arr[np.newaxis, :, :]  # (1, H, W)
                 else:
                     arr = arr.transpose(2, 0, 1)  # (3, H, W)
+
+                # --- Apply handedness-flip mirroring (before mask/crop/erase,
+                # which then all operate consistently in the flipped space) ---
+                if mirror:
+                    arr = arr[:, :, ::-1].copy()
 
                 # --- Apply skeleton-guided spatial attention mask ---
                 if spatial_mask is not None:

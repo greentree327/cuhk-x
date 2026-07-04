@@ -20,6 +20,14 @@ IMU_FEAT_PER_SENSOR = 27
 IMU_NUM_SENSORS = 5
 IMU_TOTAL_FEAT = IMU_FEAT_PER_SENSOR * IMU_NUM_SENSORS  # 135
 
+# Device-name prefixes (before the trailing "(MAC-address)" suffix), in the
+# same alphabetical order pandas' groupby(COL_DEVICE) naturally produces —
+# verified against real trial data: WTC < WTLA < WTLL < WTRA < WTRL.
+CANONICAL_SENSOR_ORDER = ["WTC", "WTLA", "WTLL", "WTRA", "WTRL"]
+# Left/right sensor swap for handedness-flip mirroring. Chest has no
+# left/right counterpart and maps to itself (omitted -> unchanged via .get).
+SENSOR_LR_SWAP = {"WTLA": "WTRA", "WTRA": "WTLA", "WTLL": "WTRL", "WTRL": "WTLL"}
+
 # Sentinel for functions returning Optional values
 _SENTINEL = object()
 
@@ -156,6 +164,103 @@ def calculate_angular_velocity_from_quat(rot_data, time_delta=1 / 200):
     return angular_vel
 
 
+def _mirror_quaternion_lr(quat_scipy):
+    """Mirror an [x,y,z,w] quaternion array through the X=0 plane (a
+    left-right body reflection), via rotation-matrix conjugation
+    R' = P @ R @ P with P = diag(-1,1,1) — then converted back to a
+    quaternion. Naively negating quaternion components does not
+    correctly represent a mirrored orientation; this matches CMI 1st
+    place's mirror_quaternion (verified against the actual notebook
+    code in Similar Competition/1st_place_solution/public_solution_ogurtsov).
+
+    Args:
+        quat_scipy: (N, 4) array, scipy [x, y, z, w] order.
+
+    Returns:
+        (N, 4) mirrored quaternion, same order. Invalid (NaN/all-zero)
+        rows pass through unchanged, matching the defensive per-row
+        convention used elsewhere in this file (see
+        remove_gravity_from_acc, calculate_angular_velocity_from_quat).
+    """
+    quat_scipy = np.asarray(quat_scipy, dtype=np.float64)
+    num_samples = quat_scipy.shape[0]
+    mirrored = quat_scipy.copy()
+    P = np.diag([-1.0, 1.0, 1.0])
+
+    for i in range(num_samples):
+        row = quat_scipy[i]
+        if np.any(np.isnan(row)) or np.all(np.isclose(row, 0)):
+            continue
+        try:
+            q_norm = normalize_quaternion(row.reshape(1, -1))[0]
+            rot_mat = R.from_quat(q_norm).as_matrix()
+            flipped_mat = P @ rot_mat @ P
+            mirrored[i] = R.from_matrix(flipped_mat).as_quat()
+        except (ValueError, RuntimeError):
+            continue
+
+    return mirrored
+
+
+def mirror_imu_sensor(acc, gyro, quat):
+    """Mirror one IMU sensor's raw readings through a left-right body
+    reflection (negate the lateral/X axis), for handedness-flip
+    augmentation (CMI 1st place's "handedness normalization" pattern,
+    ported and generalized from a deterministic per-subject correction
+    into a random on-the-fly augmentation).
+
+    Three physically distinct quantities, three distinct transforms:
+      - Acceleration is a true (polar) vector: only its X component
+        flips sign under an X-axis reflection.
+      - Angular velocity (gyro) is a pseudovector (axial vector), which
+        transforms *oppositely* to a polar vector under a reflection P:
+        omega' = det(P) * P @ omega. For P = diag(-1,1,1) (det=-1), the
+        component ALONG the mirror normal (X) is unchanged, while the
+        two in-plane components (Y, Z) flip sign — the reverse of the
+        acceleration pattern.
+      - Quaternion (orientation) mirrors via rotation-matrix
+        conjugation (see _mirror_quaternion_lr), not component
+        negation.
+
+    Args:
+        acc: (N, 3) raw acceleration, any consistent unit (g or m/s^2 —
+            a sign flip doesn't depend on scale).
+        gyro: (N, 3) raw angular velocity, any consistent unit.
+        quat: (N, 4) quaternion in CUHK-X [w, x, y, z] order.
+
+    Returns:
+        (acc_mirrored, gyro_mirrored, quat_mirrored) — same shapes,
+        units, and (for quat) column order as the inputs.
+    """
+    acc = np.asarray(acc, dtype=np.float64).copy()
+    gyro = np.asarray(gyro, dtype=np.float64)
+    quat = np.asarray(quat, dtype=np.float64)
+
+    acc[:, 0] = -acc[:, 0]
+
+    gyro_mirrored = gyro.copy()
+    gyro_mirrored[:, 1] = -gyro[:, 1]
+    gyro_mirrored[:, 2] = -gyro[:, 2]
+    # gyro_mirrored[:, 0] (X component) intentionally left unchanged.
+
+    # CUHK-X [w,x,y,z] -> scipy [x,y,z,w] (same reordering as compute_imu_features)
+    quat_scipy = np.zeros_like(quat)
+    quat_scipy[:, 0] = quat[:, 1]
+    quat_scipy[:, 1] = quat[:, 2]
+    quat_scipy[:, 2] = quat[:, 3]
+    quat_scipy[:, 3] = quat[:, 0]
+
+    quat_scipy_mirrored = _mirror_quaternion_lr(quat_scipy)
+
+    quat_mirrored = np.zeros_like(quat)
+    quat_mirrored[:, 0] = quat_scipy_mirrored[:, 3]  # w
+    quat_mirrored[:, 1] = quat_scipy_mirrored[:, 0]  # x
+    quat_mirrored[:, 2] = quat_scipy_mirrored[:, 1]  # y
+    quat_mirrored[:, 3] = quat_scipy_mirrored[:, 2]  # z
+
+    return acc, gyro_mirrored, quat_mirrored
+
+
 def compute_imu_features(acc, quat, gyro=None, time_delta=1 / 20,
                          use_synthesized=True):
     """Compute IMU features from raw sensor data.
@@ -261,7 +366,7 @@ def compute_imu_features(acc, quat, gyro=None, time_delta=1 / 20,
 
 
 def process_imu_trial(file_paths, target_seq_len=128, time_delta=1 / 20,
-                      use_synthesized=True):
+                      use_synthesized=True, mirror=False):
     """Load and preprocess one trial's IMU data (2 CSV files, 5 sensors).
 
     CUHK-X IMU files:
@@ -273,6 +378,12 @@ def process_imu_trial(file_paths, target_seq_len=128, time_delta=1 / 20,
         target_seq_len: pad/truncate to this length.
         time_delta: nominal sample interval.
         use_synthesized: if False, use raw-only features (10/sensor).
+        mirror: if True, apply handedness-flip augmentation — mirror
+            each sensor's raw signal (see mirror_imu_sensor) and swap
+            the left/right sensor slots (LA<->RA, LL<->RL) so the
+            output represents a left-right-reflected body, still laid
+            out in the same canonical sensor order as the unmirrored
+            path.
 
     Returns:
         (target_seq_len, D) float32 tensor. D = 50 (raw) or 135 (synthesized).
@@ -297,17 +408,43 @@ def process_imu_trial(file_paths, target_seq_len=128, time_delta=1 / 20,
     feat_per_sensor = 27 if use_synthesized else 10
     total_feat = feat_per_sensor * IMU_NUM_SENSORS  # 135 or 50
 
-    sensor_features = []
-    for dev_name, grp in merged.groupby(COL_DEVICE):
-        acc = grp[COL_ACC].values.astype(np.float64)
-        quat = grp[COL_QUAT].values.astype(np.float64)
-        gyro = grp[COL_GYRO].values.astype(np.float64)
+    if not mirror:
+        sensor_features = []
+        for dev_name, grp in merged.groupby(COL_DEVICE):
+            acc = grp[COL_ACC].values.astype(np.float64)
+            quat = grp[COL_QUAT].values.astype(np.float64)
+            gyro = grp[COL_GYRO].values.astype(np.float64)
 
-        feats = compute_imu_features(acc, quat, gyro=gyro, time_delta=time_delta,
-                                      use_synthesized=use_synthesized)
-        if feats is None:
-            feats = np.zeros((0, feat_per_sensor), dtype=np.float32)
-        sensor_features.append(feats)
+            feats = compute_imu_features(acc, quat, gyro=gyro, time_delta=time_delta,
+                                          use_synthesized=use_synthesized)
+            if feats is None:
+                feats = np.zeros((0, feat_per_sensor), dtype=np.float32)
+            sensor_features.append(feats)
+    else:
+        # Handedness flip: mirror each sensor's raw signal, then swap the
+        # left/right sensor slots (LA<->RA, LL<->RL) so the position that
+        # used to hold the left sensor's data now holds the (mirrored)
+        # right sensor's data and vice versa — the tensor layout still
+        # matches "canonical sensor order", just describing a reflected
+        # body. Matched on device-name PREFIX (not positional/alphabetical
+        # order), since that's the only thing guaranteed stable across
+        # trials — verified against real device names.
+        sensor_by_code = {}
+        for dev_name, grp in merged.groupby(COL_DEVICE):
+            code = dev_name.split("(")[0]
+            acc = grp[COL_ACC].values.astype(np.float64)
+            quat = grp[COL_QUAT].values.astype(np.float64)
+            gyro = grp[COL_GYRO].values.astype(np.float64)
+
+            acc, gyro, quat = mirror_imu_sensor(acc, gyro, quat)
+            feats = compute_imu_features(acc, quat, gyro=gyro, time_delta=time_delta,
+                                          use_synthesized=use_synthesized)
+            if feats is None:
+                feats = np.zeros((0, feat_per_sensor), dtype=np.float32)
+            sensor_by_code[SENSOR_LR_SWAP.get(code, code)] = feats
+
+        sensor_features = [sensor_by_code[code] for code in CANONICAL_SENSOR_ORDER
+                           if code in sensor_by_code]
 
     if not sensor_features:
         return torch.zeros(target_seq_len, total_feat, dtype=torch.float32)
