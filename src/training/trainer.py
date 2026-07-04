@@ -96,10 +96,40 @@ class Trainer:
             weight_decay=config.weight_decay
         )
 
-        # Scheduler: CosineAnnealingWarmRestarts
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer, T_0=10, T_mult=2, eta_min=config.lr_min
-        )
+        # Scheduler: linear warmup, then monotonic cosine decay over the
+        # rest of the run. CosineAnnealingWarmRestarts (T_0=10, T_mult=2)
+        # was tried first, but on this dataset's short per-epoch step
+        # count (~34 steps/epoch at 546 train clips / batch 16), each
+        # restart snapped LR from ~1e-6 back to 1e-3 and visibly knocked
+        # train loss back up (confirmed live: epoch 9->10 LR 2.5e-5->1e-3,
+        # train loss 3.03->3.08) right as early stopping (patience=20) was
+        # watching val_acc — a real run early-stopped at epoch 25 without
+        # ever recovering past its pre-restart best. A single monotonic
+        # decay removes that whiplash entirely. warmup_epochs (previously
+        # declared in Config but never actually wired to anything) ramps
+        # LR up from 10% instead of starting a freshly-initialized model
+        # (including the cross_modal_attention block's random
+        # MultiheadAttention weights, when enabled) at full LR on step 1.
+        # Capped at 25% of the run so a short calibration run (e.g.
+        # CUHKX_EPOCHS=10) doesn't spend half its budget warming up.
+        warmup_epochs = min(config.warmup_epochs, max(1, config.epochs // 4))
+        if warmup_epochs > 0 and config.epochs > warmup_epochs:
+            self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+                self.optimizer,
+                schedulers=[
+                    torch.optim.lr_scheduler.LinearLR(
+                        self.optimizer, start_factor=0.1, end_factor=1.0,
+                        total_iters=warmup_epochs),
+                    torch.optim.lr_scheduler.CosineAnnealingLR(
+                        self.optimizer, T_max=config.epochs - warmup_epochs,
+                        eta_min=config.lr_min),
+                ],
+                milestones=[warmup_epochs],
+            )
+        else:
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=config.epochs, eta_min=config.lr_min
+            )
 
         # Early stopping
         self.early_stopping = EarlyStopping(
@@ -172,29 +202,37 @@ class Trainer:
                           weights_only=False)
 
         # output_dir (and therefore last_checkpoint_path) is keyed only by
-        # config label (e.g. "synthesized"), not by which FeatureFlags
-        # produced it. Changing an architecture flag (segment_pooling,
-        # cross_modal_attention, ...) between runs that reuse the same
-        # output_dir leaves a checkpoint on disk whose layer shapes no
-        # longer match this run's model — load_state_dict raises in that
-        # case. Since this is the first state mutation in this method, a
-        # failure here leaves model/optimizer/scheduler/scaler/ema/
-        # early_stopping exactly as freshly constructed, so falling back
-        # to "start this fold from scratch" is safe and self-healing (the
-        # stale checkpoint gets overwritten at the end of epoch 0).
+        # config label (e.g. "synthesized"), not by which FeatureFlags or
+        # scheduler produced it. Changing an architecture flag
+        # (segment_pooling, cross_modal_attention, ...) or the LR
+        # scheduler class between runs that reuse the same output_dir
+        # leaves a checkpoint on disk that no longer matches this run's
+        # model/optimizer/scheduler — any of the loads below can raise.
+        # A snapshot of the freshly-constructed model's own state is
+        # taken first and restored on failure, so a partial load (e.g.
+        # model succeeds, then scheduler fails because its class
+        # changed) can't leave the model holding old checkpoint weights
+        # while everything else silently resets to fresh — that would be
+        # an inconsistent, worse-than-either state. Falling back to a
+        # fully fresh start is self-healing either way (the stale
+        # checkpoint gets overwritten at the end of epoch 0).
+        import copy
+        fresh_model_state = copy.deepcopy(self.model.state_dict())
         try:
             self.model.load_state_dict(ckpt["model_state_dict"])
-        except RuntimeError as e:
+            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            self.scaler.load_state_dict(ckpt["scaler_state_dict"])
+            self.ema.shadow = {k: v.to(self.device) for k, v in ckpt["ema_shadow"].items()}
+        except (RuntimeError, KeyError, ValueError) as e:
+            self.model.load_state_dict(fresh_model_state)
             print(f"  WARNING: checkpoint at {self.last_checkpoint_path} doesn't "
-                  f"match the current model architecture (likely a FeatureFlags "
-                  f"change since it was saved) — starting fold {self.fold + 1} "
-                  f"from scratch instead of resuming.\n    {e}")
+                  f"match the current run's model/optimizer/scheduler configuration "
+                  f"(likely a FeatureFlags or hyperparameter change since it was "
+                  f"saved) — starting fold {self.fold + 1} from scratch instead of "
+                  f"resuming.\n    {e}")
             return 0
 
-        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        self.scaler.load_state_dict(ckpt["scaler_state_dict"])
-        self.ema.shadow = {k: v.to(self.device) for k, v in ckpt["ema_shadow"].items()}
         self.early_stopping.best_score = ckpt["early_stopping_best_score"]
         self.early_stopping.counter = ckpt["early_stopping_counter"]
         self.early_stopping.early_stop = ckpt["early_stopping_early_stop"]
@@ -448,7 +486,29 @@ class Trainer:
         return batch
 
     def _save_checkpoint(self, epoch, acc, is_best=False):
-        """Save model checkpoint."""
+        """Save model checkpoint.
+
+        Saves the EMA shadow weights, not the raw training weights.
+        `acc` (the metric that made this "best") was measured in
+        validate() against the EMA shadow, not the raw weights — by the
+        time validate() returns, it has already called
+        ema.restore_original(), so self.model's live parameters are back
+        to the noisier raw training weights. Saving those here would
+        silently decouple the checkpoint actually used for inference
+        (see inference.py, which loads model_state_dict directly) from
+        the metric used to select it, defeating the entire point of
+        using EMA (CMI standard practice for stable inference).
+
+        Note: state_dict() returns tensors that alias the live
+        parameters' storage, not copies — so torch.save() must happen
+        while EMA weights are still applied. Restoring raw weights
+        before saving (an earlier version of this fix did exactly that)
+        would silently overwrite the checkpoint's tensors back to raw
+        via restore_original()'s in-place copy_, before the bytes ever
+        reach disk, making the "fix" a no-op.
+        """
+        self.ema.save_original()
+        self.ema.apply_shadow()
         checkpoint = {
             "epoch": epoch,
             "model_state_dict": self.model.state_dict(),
@@ -458,6 +518,7 @@ class Trainer:
             "config": self.config,
         }
         torch.save(checkpoint, self.best_model_path)
+        self.ema.restore_original()
 
 
 def run_cross_validation(config=None):

@@ -51,15 +51,6 @@ class ModelEMA:
             if param.requires_grad:
                 param.data.copy_(self.shadow[name])
 
-    def restore(self):
-        """Restore original model weights (after evaluation)."""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                param.data.copy_(self.shadow[name])
-        # Actually this is the same as apply_shadow — the pattern is:
-        # save original → apply shadow → eval → restore original
-        pass
-
     def save_original(self):
         """Save current model weights before applying EMA shadow."""
         self.backup = {}
