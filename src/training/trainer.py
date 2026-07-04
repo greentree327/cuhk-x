@@ -161,14 +161,36 @@ class Trainer:
         instead of restarting the fold from scratch.
 
         Returns:
-            int: epoch index to resume training from (0 if no checkpoint).
+            int: epoch index to resume training from (0 if no checkpoint,
+            or if a checkpoint exists but doesn't match the current model
+            architecture — see the architecture-mismatch handling below).
         """
         if not self.last_checkpoint_path.exists():
             return 0
 
         ckpt = torch.load(self.last_checkpoint_path, map_location=self.device,
                           weights_only=False)
-        self.model.load_state_dict(ckpt["model_state_dict"])
+
+        # output_dir (and therefore last_checkpoint_path) is keyed only by
+        # config label (e.g. "synthesized"), not by which FeatureFlags
+        # produced it. Changing an architecture flag (segment_pooling,
+        # cross_modal_attention, ...) between runs that reuse the same
+        # output_dir leaves a checkpoint on disk whose layer shapes no
+        # longer match this run's model — load_state_dict raises in that
+        # case. Since this is the first state mutation in this method, a
+        # failure here leaves model/optimizer/scheduler/scaler/ema/
+        # early_stopping exactly as freshly constructed, so falling back
+        # to "start this fold from scratch" is safe and self-healing (the
+        # stale checkpoint gets overwritten at the end of epoch 0).
+        try:
+            self.model.load_state_dict(ckpt["model_state_dict"])
+        except RuntimeError as e:
+            print(f"  WARNING: checkpoint at {self.last_checkpoint_path} doesn't "
+                  f"match the current model architecture (likely a FeatureFlags "
+                  f"change since it was saved) — starting fold {self.fold + 1} "
+                  f"from scratch instead of resuming.\n    {e}")
+            return 0
+
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         self.scaler.load_state_dict(ckpt["scaler_state_dict"])
