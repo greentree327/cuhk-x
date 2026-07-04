@@ -42,7 +42,12 @@ class InferencePipeline:
         # Load models
         for ckpt_path in checkpoint_paths:
             model = HARModel(config).to(self.device)
-            checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=True)
+            # weights_only=True (the default since PyTorch 2.6) rejects the
+            # checkpoint's "config" entry — a Config/FeatureFlags dataclass,
+            # not a plain tensor. Safe to disable here: these checkpoints
+            # are only ever produced by our own Trainer._save_checkpoint(),
+            # never loaded from an untrusted external source.
+            checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
             model.load_state_dict(checkpoint["model_state_dict"])
             model.eval()
             self.models.append(model)
