@@ -312,8 +312,8 @@ class Trainer:
         print(f"\n{'='*60}")
         print(f"  Fold {self.fold + 1}/{self.config.n_folds}")
         print(f"  Train: {len(self.train_dataset)} clips, Val: {len(self.val_dataset)} clips")
-        print(f"  Params: {self.model.get_parameter_count():.1f}M")
-        print(f"{'='*60}\n")
+        print(f"{'='*60}")
+        self.model.log_parameter_breakdown()
 
         # Resumed from a checkpoint that already finished this fold (either
         # ran out its full epoch budget, or early-stopped) — nothing to do.

@@ -276,3 +276,67 @@ class HARModel(nn.Module):
     def get_parameter_count(self):
         """Return total number of trainable parameters in millions."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad) / 1e6
+
+    def get_parameter_breakdown(self):
+        """Per-component trainable parameter counts, for understanding
+        where the model's size (and the competition's 100MB budget) is
+        actually spent.
+
+        Returns:
+            dict of component_name -> {"params_m": float, "mb": float,
+            "pct": float of total}, plus a "total" entry. mb assumes
+            float32 (4 bytes/param), matching how the competition's size
+            limit is normally measured.
+        """
+        components = {
+            "imu_encoder": self.imu_encoder,
+            "radar_encoder": self.radar_encoder,
+            "skeleton_encoder": self.skeleton_encoder,
+            "depth_encoder": self.depth_encoder,
+            "ir_encoder": self.ir_encoder,
+            "thermal_encoder": self.thermal_encoder,
+            "fusion": self.fusion,
+            "aux_head": self.aux_head,
+        }
+        total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+        breakdown = {}
+        for name, module in components.items():
+            n = sum(p.numel() for p in module.parameters() if p.requires_grad)
+            breakdown[name] = {
+                "params_m": n / 1e6,
+                "mb": n * 4 / 1e6,
+                "pct": 100.0 * n / total_params if total_params > 0 else 0.0,
+            }
+        breakdown["total"] = {
+            "params_m": total_params / 1e6,
+            "mb": total_params * 4 / 1e6,
+            "pct": 100.0,
+        }
+        return breakdown
+
+    def log_parameter_breakdown(self):
+        """Print a formatted per-component parameter/size breakdown."""
+        breakdown = self.get_parameter_breakdown()
+        active_flags = [
+            name for name, on in [
+                ("segment_pooling", self.config.flags.use_segment_pooling),
+                ("cross_modal_attention", self.config.flags.use_cross_modal_attention),
+                ("synthesized_features", self.config.flags.use_synthesized_features),
+            ] if on
+        ]
+        flags_str = ", ".join(active_flags) if active_flags else "none"
+        print(f"{'='*60}")
+        print(f"  Model size breakdown (float32)")
+        print(f"  Active architecture flags: {flags_str}")
+        print(f"{'='*60}")
+        for name, info in breakdown.items():
+            if name == "total":
+                continue
+            print(f"  {name:16s} {info['params_m']:7.3f}M params  "
+                  f"{info['mb']:7.2f} MB  ({info['pct']:5.1f}%)")
+        print(f"  {'-'*56}")
+        total = breakdown["total"]
+        print(f"  {'TOTAL':16s} {total['params_m']:7.3f}M params  "
+              f"{total['mb']:7.2f} MB  (budget: {total['mb']:.1f} / 100 MB)")
+        print(f"{'='*60}")
