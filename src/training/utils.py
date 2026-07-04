@@ -11,7 +11,7 @@ import copy
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold
 
 
 class ModelEMA:
@@ -165,24 +165,22 @@ def accuracy(output, target, topk=(1,)):
         return res
 
 
-def create_folds(clip_list, config, n_folds=5, seed=42):
-    """Create StratifiedGroupKFold splits for validation WITHIN train users.
-
-    Note: The competition specifies a hardcoded cross-subject split:
-    Train: users 1-9, 16-24 | Test: users 10-11, 25-26.
-    This function creates internal validation folds from the TRAIN users only.
-    The test users are NEVER used during training.
+def _filter_train_users(clip_list, config):
+    """Filter clip_list down to train-users-only, with parallel arrays for
+    stratified/grouped splitting. Shared by create_folds() and
+    _create_single_split() since both need the same setup.
 
     Args:
         clip_list: list of (user_id, user, trial, action_id) tuples.
-        config: Config object with train_users/test_users.
-        n_folds: number of internal validation folds.
-        seed: random seed.
+        config: Config object with train_users.
 
     Returns:
-        list of (train_indices, val_indices) per fold (using train users only).
+        (train_indices_all, users, labels, indices):
+            train_indices_all: original clip_list positions for train users.
+            users: array of user_id per train clip (grouping key).
+            labels: array of action_id per train clip (stratification key).
+            indices: np.arange(len(train_indices_all)), for sklearn's split().
     """
-    # Filter to only training users
     train_users_set = set(config.train_users)
     train_indices_all = [
         i for i, item in enumerate(clip_list)
@@ -195,11 +193,74 @@ def create_folds(clip_list, config, n_folds=5, seed=42):
             f"{config.train_users}"
         )
 
-    # Extract labels and user IDs for StratifiedGroupKFold
     train_clips_subset = [clip_list[i] for i in train_indices_all]
     users = np.array([item[0] for item in train_clips_subset])
     labels = np.array([item[3] for item in train_clips_subset])
     indices = np.arange(len(train_clips_subset))
+    return train_indices_all, users, labels, indices
+
+
+def _create_single_split(clip_list, config, val_size=0.2, seed=42):
+    """Single stratified-by-user train/val split (not k-fold).
+
+    For quick iteration/debugging — confirming the pipeline runs, or
+    getting a real per-epoch timing number — where a full k-fold sweep
+    isn't needed. Trains exactly one model instead of n_folds models.
+
+    Not stratified by class label (GroupShuffleSplit only groups by user,
+    unlike StratifiedGroupKFold), so with this dataset's 27.5:1 class
+    imbalance the rarest classes may be thin or absent from the validation
+    split — acceptable for a sanity check, not a substitute for the real
+    k-fold run.
+
+    Args:
+        clip_list: list of (user_id, user, trial, action_id) tuples.
+        config: Config object with train_users.
+        val_size: fraction of train users held out for validation. 0.2
+            matches the ~20% validation proportion a 5-fold run gives per
+            fold, for a roughly comparable split size.
+        seed: random seed.
+
+    Returns:
+        list containing exactly one (train_indices, val_indices) tuple,
+        matching create_folds()'s return shape.
+    """
+    train_indices_all, users, labels, indices = _filter_train_users(clip_list, config)
+
+    gss = GroupShuffleSplit(n_splits=1, test_size=val_size, random_state=seed)
+    train_sub_idx, val_sub_idx = next(gss.split(indices, groups=users))
+
+    train_idx_orig = [train_indices_all[i] for i in train_sub_idx]
+    val_idx_orig = [train_indices_all[i] for i in val_sub_idx]
+    return [(train_idx_orig, val_idx_orig)]
+
+
+def create_folds(clip_list, config, n_folds=5, seed=42):
+    """Create StratifiedGroupKFold splits for validation WITHIN train users.
+
+    Note: The competition specifies a hardcoded cross-subject split:
+    Train: users 1-9, 16-24 | Test: users 10-11, 25-26.
+    This function creates internal validation folds from the TRAIN users only.
+    The test users are NEVER used during training.
+
+    n_folds == 1 is handled as a single train/val split (see
+    _create_single_split) rather than k-fold CV, which is mathematically
+    undefined for k=1 (StratifiedGroupKFold raises ValueError for
+    n_splits=1 — there's no held-out fold left over).
+
+    Args:
+        clip_list: list of (user_id, user, trial, action_id) tuples.
+        config: Config object with train_users/test_users.
+        n_folds: number of internal validation folds. 1 = single split.
+        seed: random seed.
+
+    Returns:
+        list of (train_indices, val_indices) per fold (using train users only).
+    """
+    if n_folds == 1:
+        return _create_single_split(clip_list, config, seed=seed)
+
+    train_indices_all, users, labels, indices = _filter_train_users(clip_list, config)
 
     sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
     folds_mapped = []
