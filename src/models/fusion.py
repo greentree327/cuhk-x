@@ -14,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from .encoders import IMUEncoder, FrameEncoder, RadarEncoder, SkeletonEncoder
+from layers import CrossModalFusion
 
 
 class FusionHead(nn.Module):
@@ -27,15 +28,19 @@ class FusionHead(nn.Module):
         hidden_dim: hidden dimension in fusion MLP.
         num_classes: number of action classes.
         dropout: dropout rate.
+        use_cross_modal_attention: let modality embeddings attend to each
+            other (CrossModalFusion) before concatenation, instead of pure
+            late fusion. See CrossModalFusion's docstring.
     """
 
     MAX_MODALITIES = 10  # upper bound
 
     def __init__(self, num_modalities=6, encoder_dim=256, hidden_dim=512,
-                 num_classes=40, dropout=0.3):
+                 num_classes=40, dropout=0.3, use_cross_modal_attention=False):
         super().__init__()
         self.num_modalities = num_modalities
         self.encoder_dim = encoder_dim
+        self.use_cross_modal_attention = use_cross_modal_attention
 
         # Learned "missing modality" embedding tokens
         self.missing_tokens = nn.ParameterList([
@@ -45,6 +50,9 @@ class FusionHead(nn.Module):
         # Initialize with small random values
         for token in self.missing_tokens:
             nn.init.normal_(token, std=0.02)
+
+        if use_cross_modal_attention:
+            self.cross_modal = CrossModalFusion(encoder_dim, num_heads=4, dropout=dropout)
 
         concat_dim = num_modalities * encoder_dim
 
@@ -89,7 +97,17 @@ class FusionHead(nn.Module):
                 present = flags[:, i].unsqueeze(-1)  # (batch, 1)
                 fused.append(present * emb + (1.0 - present) * token)
 
-        x = torch.cat(fused, dim=-1)
+        if self.use_cross_modal_attention:
+            # Stack into a length-num_modalities "sequence" so each
+            # modality's vector can attend to every other modality's vector
+            # before fusion, then flatten back to the same shape
+            # torch.cat(fused) would have produced.
+            modality_seq = torch.stack(fused, dim=1)   # (B, num_modalities, encoder_dim)
+            modality_seq = self.cross_modal(modality_seq)
+            x = modality_seq.reshape(batch_size, -1)   # (B, num_modalities * encoder_dim)
+        else:
+            x = torch.cat(fused, dim=-1)
+
         penultimate = self.mlp(x)
         logits = self.classifier(penultimate)
 
@@ -126,7 +144,8 @@ class HARModel(nn.Module):
         self.radar_encoder = RadarEncoder(
             point_dim=config.radar_point_dim, max_points=config.radar_max_points,
             encoder_dim=enc_dim, dropout=config.dropout,
-            weight_decay=config.weight_decay
+            weight_decay=config.weight_decay,
+            use_segment_pooling=seg_pool, n_segments=n_seg,
         )
         self.skeleton_encoder = SkeletonEncoder(
             num_joints=config.skel_num_joints, joint_dim=config.skel_joint_dim,
@@ -139,20 +158,32 @@ class HARModel(nn.Module):
         # Frame encoders (separate instances per modality, trained from scratch)
         # Depth_Color and Thermal are 3-channel, IR is 1-channel (grayscale)
         self.depth_encoder = FrameEncoder(
-            in_channels=3, encoder_dim=enc_dim, dropout=config.dropout
+            in_channels=3, encoder_dim=enc_dim, dropout=config.dropout,
+            use_segment_pooling=seg_pool, n_segments=n_seg,
         )
         self.ir_encoder = FrameEncoder(
-            in_channels=1, encoder_dim=enc_dim, dropout=config.dropout
+            in_channels=1, encoder_dim=enc_dim, dropout=config.dropout,
+            use_segment_pooling=seg_pool, n_segments=n_seg,
         )
         self.thermal_encoder = FrameEncoder(
-            in_channels=3, encoder_dim=enc_dim, dropout=config.dropout
+            in_channels=3, encoder_dim=enc_dim, dropout=config.dropout,
+            use_segment_pooling=seg_pool, n_segments=n_seg,
         )
+
+        # All 6 encoders are constructed with the same seg_pool/n_seg toggle,
+        # so they share one effective per-modality embedding dimension:
+        # enc_dim normally, or enc_dim * n_seg when segment pooling is on
+        # (SegmentPooling concatenates rather than averages its segments —
+        # see layers/__init__.py). FusionHead and CrossModalFusion both need
+        # to know this to size their layers correctly.
+        effective_dim = self.imu_encoder.pool_out_dim
 
         # Fusion
         self.fusion = FusionHead(
-            num_modalities=6, encoder_dim=enc_dim,
+            num_modalities=6, encoder_dim=effective_dim,
             hidden_dim=config.fusion_hidden, num_classes=config.num_classes,
-            dropout=config.dropout
+            dropout=config.dropout,
+            use_cross_modal_attention=config.flags.use_cross_modal_attention,
         )
 
         # Auxiliary head: predict coarse action category

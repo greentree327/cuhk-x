@@ -33,6 +33,9 @@ class FeatureFlags:
     use_segment_pooling: bool = False          # 3-segment (early/mid/late) temporal pooling for time-series
     segment_count: int = 3                     # number of segments for pooling
 
+    # -- Fusion architecture --
+    use_cross_modal_attention: bool = False    # let modality embeddings attend to each other before fusion (CMI 1st place pattern), instead of pure late-fusion concat
+
     # -- Auxiliary supervision --
     use_aux_category_loss: bool = True         # coarse 8-category auxiliary classifier
     aux_loss_weight: float = 0.2               # weight of auxiliary loss in total

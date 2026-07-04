@@ -249,3 +249,62 @@ class SegmentPooling(nn.Module):
             segment_outputs.append(seg_out)
 
         return torch.cat(segment_outputs, dim=-1)  # (B, n_seg * D)
+
+
+class CrossModalFusion(nn.Module):
+    """Lets modality-level embeddings attend to each other before fusion,
+    instead of pure late-fusion concatenation (CMI 1st place pattern).
+
+    Operates over a short "sequence" of one already-pooled vector per
+    modality (length = num_modalities, typically 6) — computationally
+    trivial compared to per-timestep cross-attention across each
+    modality's full (and very differently-lengthed: IMU 128, Skeleton 42,
+    Radar 82, frames 16-32) time axis, but still lets e.g. the IMU vector
+    be modulated by what the Skeleton vector contains (and vice versa)
+    before the classifier ever sees them — something plain concatenation
+    + MLP can only approximate indirectly through the MLP's weights, never
+    directly conditioning one modality's representation on another's.
+
+    Standard single-layer Transformer-encoder block: multi-head
+    self-attention + residual + layernorm, then a small feedforward +
+    residual + layernorm. Missing modalities don't need special handling
+    here — the caller substitutes them with a learned "missing" token
+    before this module ever sees the sequence (see FusionHead), so every
+    position is already a well-formed vector.
+
+    Args:
+        embed_dim: dimension of each modality's embedding. Must be
+            divisible by num_heads.
+        num_heads: attention heads.
+        dropout: dropout rate (applied inside attention and the feedforward).
+    """
+
+    def __init__(self, embed_dim, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 2, embed_dim),
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+
+    def forward(self, modality_seq):
+        """
+        Args:
+            modality_seq: (batch, num_modalities, embed_dim).
+
+        Returns:
+            (batch, num_modalities, embed_dim) — same shape, each
+            modality's vector now informed by cross-attention over all
+            modalities (including itself, standard self-attention).
+        """
+        attn_out, _ = self.attn(modality_seq, modality_seq, modality_seq)
+        x = self.norm1(modality_seq + attn_out)
+        ff_out = self.ff(x)
+        x = self.norm2(x + ff_out)
+        return x

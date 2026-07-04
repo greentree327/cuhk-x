@@ -70,8 +70,17 @@ class IMUEncoder(nn.Module):
         # Fusion block
         self.fusion = ResidualSECNNBlock(256 * 3, encoder_dim, 3, dropout, weight_decay)
 
-        # Attention pooling
-        self.pool = AttentionPooling(encoder_dim)
+        # Attention pooling (segment pooling splits the pooled output into
+        # n_segments early/mid/late chunks instead of one vector — see
+        # SegmentPooling's docstring. pool_out_dim is what downstream fusion
+        # code needs to know to size itself correctly.)
+        self.use_segment_pooling = use_segment_pooling
+        if use_segment_pooling:
+            self.pool = SegmentPooling(encoder_dim, n_segments)
+            self.pool_out_dim = encoder_dim * n_segments
+        else:
+            self.pool = AttentionPooling(encoder_dim)
+            self.pool_out_dim = encoder_dim
 
     def forward(self, x, lengths):
         """Forward pass.
@@ -81,7 +90,7 @@ class IMUEncoder(nn.Module):
             lengths: (batch,) long tensor of true sequence lengths.
 
         Returns:
-            (batch, encoder_dim) embedding.
+            (batch, pool_out_dim) embedding.
         """
         x = x.transpose(1, 2)  # (batch, input_dim, seq_len)
         seq_len = x.size(2)
@@ -131,11 +140,19 @@ class FrameEncoder(nn.Module):
         encoder_dim: output embedding dimension (default 256).
         base_width: base channel count, doubles each stage. Default 32.
         dropout: dropout rate.
+        use_segment_pooling: split pooling into early/mid/late chunks (see
+            SegmentPooling). Frame modalities always sample a fixed frame
+            count uniformly from however many native frames exist, so
+            (unlike IMU/Skeleton/Radar, whose fixed-length sequences can be
+            mostly trailing zero-padding for short clips) segments here are
+            usually real content end-to-end rather than padding.
+        n_segments: number of segments when use_segment_pooling=True.
     """
 
     MAX_FRAMES = 256  # upper bound for frame count
 
-    def __init__(self, in_channels=3, encoder_dim=256, base_width=32, dropout=0.3):
+    def __init__(self, in_channels=3, encoder_dim=256, base_width=32, dropout=0.3,
+                 use_segment_pooling=False, n_segments=3):
         super().__init__()
         self.encoder_dim = encoder_dim
 
@@ -156,8 +173,14 @@ class FrameEncoder(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # Temporal attention pooling
-        self.pool = AttentionPooling(encoder_dim)
+        # Temporal pooling
+        self.use_segment_pooling = use_segment_pooling
+        if use_segment_pooling:
+            self.pool = SegmentPooling(encoder_dim, n_segments)
+            self.pool_out_dim = encoder_dim * n_segments
+        else:
+            self.pool = AttentionPooling(encoder_dim)
+            self.pool_out_dim = encoder_dim
 
     @staticmethod
     def _conv_block(in_ch, out_ch, stride=2):
@@ -179,11 +202,11 @@ class FrameEncoder(nn.Module):
                    C=3 for Depth_Color/Thermal, C=1 for IR.
 
         Returns:
-            (batch, encoder_dim) embedding.
+            (batch, pool_out_dim) embedding.
             Returns zero tensor of correct shape if frames is empty.
         """
         if frames.numel() == 0:
-            return torch.zeros(0, self.encoder_dim, device=frames.device)
+            return torch.zeros(0, self.pool_out_dim, device=frames.device)
 
         B, N, C, H, W = frames.shape
         # Flatten batch+frame dims for shared conv processing
@@ -211,14 +234,19 @@ class RadarEncoder(nn.Module):
         encoder_dim: output embedding dimension.
         dropout: dropout rate.
         weight_decay: L2 regularization.
+        use_segment_pooling: split pooling into early/mid/late chunks (see
+            SegmentPooling).
+        n_segments: number of segments when use_segment_pooling=True.
     """
 
     MAX_POINTS = 512  # upper bound
 
     def __init__(self, point_dim=6, max_points=64, encoder_dim=256,
-                 dropout=0.3, weight_decay=1e-4):
+                 dropout=0.3, weight_decay=1e-4,
+                 use_segment_pooling=False, n_segments=3):
         super().__init__()
         self.max_points = max_points
+        self.encoder_dim = encoder_dim
 
         # PointNet MLP (shared per-point)
         self.point_mlp = nn.Sequential(
@@ -236,7 +264,13 @@ class RadarEncoder(nn.Module):
             ResidualSECNNBlock(128, encoder_dim, 5, dropout, weight_decay),
         )
 
-        self.pool = AttentionPooling(encoder_dim)
+        self.use_segment_pooling = use_segment_pooling
+        if use_segment_pooling:
+            self.pool = SegmentPooling(encoder_dim, n_segments)
+            self.pool_out_dim = encoder_dim * n_segments
+        else:
+            self.pool = AttentionPooling(encoder_dim)
+            self.pool_out_dim = encoder_dim
 
     def forward(self, radar_data, lengths):
         """Forward pass.
@@ -246,10 +280,10 @@ class RadarEncoder(nn.Module):
             lengths: (batch,) long tensor of true frame counts.
 
         Returns:
-            (batch, encoder_dim) embedding.
+            (batch, pool_out_dim) embedding.
         """
         if radar_data.numel() == 0:
-            return torch.zeros(0, self.encoder_dim, device=radar_data.device)
+            return torch.zeros(0, self.pool_out_dim, device=radar_data.device)
 
         B, F, P, D = radar_data.shape
 
@@ -294,6 +328,7 @@ class SkeletonEncoder(nn.Module):
         if input_dim is None:
             input_dim = num_joints * joint_dim  # 51 default
         self.input_dim = input_dim
+        self.encoder_dim = encoder_dim
 
         self.cnn = nn.Sequential(
             ResidualSECNNBlock(input_dim, 128, 3, dropout, weight_decay),
@@ -301,7 +336,13 @@ class SkeletonEncoder(nn.Module):
             ResidualSECNNBlock(256, encoder_dim, 7, dropout, weight_decay),
         )
 
-        self.pool = AttentionPooling(encoder_dim)
+        self.use_segment_pooling = use_segment_pooling
+        if use_segment_pooling:
+            self.pool = SegmentPooling(encoder_dim, n_segments)
+            self.pool_out_dim = encoder_dim * n_segments
+        else:
+            self.pool = AttentionPooling(encoder_dim)
+            self.pool_out_dim = encoder_dim
 
     def forward(self, skeleton, lengths):
         """Forward pass.
@@ -311,10 +352,10 @@ class SkeletonEncoder(nn.Module):
             lengths: (batch,) long tensor of true sequence lengths.
 
         Returns:
-            (batch, encoder_dim) embedding.
+            (batch, pool_out_dim) embedding.
         """
         if skeleton.numel() == 0:
-            return torch.zeros(0, self.encoder_dim, device=skeleton.device)
+            return torch.zeros(0, self.pool_out_dim, device=skeleton.device)
 
         x = skeleton.transpose(1, 2)  # (batch, input_dim, seq_len)
         seq_len = x.size(2)
