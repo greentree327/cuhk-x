@@ -41,16 +41,6 @@ def _env_int(name, default):
     return int(val) if val else default
 
 
-def _env_bool(name, default):
-    """Same empty-string-means-unset handling as _env_str, parsed as a
-    bool. "1"/"true"/"yes" (case-insensitive) -> True; any other non-empty
-    value -> False."""
-    val = _env_str(name, "")
-    if not val:
-        return default
-    return val.strip().lower() in ("1", "true", "yes")
-
-
 # Overridable so checkpoints/logs can be redirected to persistent storage
 # (e.g. a Google Drive mount in Colab) without moving the code itself there.
 # Defaults to "output" (unchanged local behavior) when unset.
@@ -84,8 +74,6 @@ def run_config(label, cfg):
     log(f"  synth={cfg.flags.use_synthesized_features} mask={cfg.flags.use_skeleton_attention_mask} "
         f"crop={cfg.flags.use_spatial_crop} erase={cfg.flags.use_random_erase}")
     log(f"  aux={cfg.flags.use_aux_category_loss} cls_wt={cfg.flags.use_class_weights}")
-    log(f"  seg_pool={cfg.flags.use_segment_pooling} cross_modal_attn={cfg.flags.use_cross_modal_attention} "
-        f"time_aligned_frame_attn={cfg.flags.use_time_aligned_frame_attention}")
     log(f"  imu_dim={cfg.imu_input_dim} skel_dim={cfg.skel_input_dim} "
         f"epochs={cfg.epochs} folds={cfg.n_folds} batch={cfg.batch_size}")
     log(f"{'#'*70}")
@@ -157,17 +145,6 @@ def main():
         batch_size=16, num_workers=2, mixed_precision=True,
     )
 
-    # The 3 newer architecture toggles (all default False, matching each
-    # flag's own default in config.py, so this is a no-op unless you
-    # explicitly set the env var) — applied uniformly to all 3 configs, on
-    # top of whatever each config's own flags already set (e.g. "minimal"
-    # turning off the older feature flags below still happens first).
-    arch_flags = dict(
-        use_segment_pooling=_env_bool("CUHKX_SEGMENT_POOLING", False),
-        use_cross_modal_attention=_env_bool("CUHKX_CROSS_MODAL_ATTENTION", False),
-        use_time_aligned_frame_attention=_env_bool("CUHKX_TIME_ALIGNED_FRAME_ATTENTION", False),
-    )
-
     c1 = Config()
     c1.output_dir = OUTPUT_ROOT / "minimal"
     for a in ['use_synthesized_features','use_skeleton_attention_mask',
@@ -175,18 +152,15 @@ def main():
               'use_class_weights']:
         setattr(c1.flags, a, False)
     for k, v in base.items(): setattr(c1, k, v)
-    for k, v in arch_flags.items(): setattr(c1.flags, k, v)
 
     c2 = Config()
     c2.output_dir = OUTPUT_ROOT / "baseline"
     for k, v in base.items(): setattr(c2, k, v)
-    for k, v in arch_flags.items(): setattr(c2.flags, k, v)
 
     c3 = Config()
     c3.flags.use_synthesized_features = True
     c3.output_dir = OUTPUT_ROOT / "synthesized"
     for k, v in base.items(): setattr(c3, k, v)
-    for k, v in arch_flags.items(): setattr(c3.flags, k, v)
 
     # Which configs to run is also overridable, so a calibration run can
     # target just one (e.g. CUHKX_CONFIGS=minimal) instead of all three.
