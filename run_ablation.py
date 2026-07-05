@@ -148,9 +148,20 @@ def main():
     # empty string the same as unset — IPython's `%env VAR=` sets VAR to ""
     # rather than actually removing it, and os.environ.get()'s default only
     # applies when the key is absent, not when it's present-but-empty.
+    # encoder_dim likewise overridable — 546-573 train clips across 40
+    # classes with only ~12-15 training users per fold (cross-subject
+    # StratifiedGroupKFold) means capacity matters a lot: two separate
+    # runs (minimal and synthesized, both with segment_pooling/
+    # cross_modal_attention/handedness_flip off) showed train acc
+    # climbing past 50-60% while val plateaued/degraded around 15-20% —
+    # a real cross-subject generalization gap, not a data-leakage
+    # artifact (folds are grouped by user_id, never split within a
+    # user). Default 256 is unchanged; try CUHKX_ENCODER_DIM=128 to test
+    # whether cutting capacity narrows that gap.
     base = dict(
         epochs=_env_int("CUHKX_EPOCHS", 60),
         n_folds=_env_int("CUHKX_N_FOLDS", 5),
+        encoder_dim=_env_int("CUHKX_ENCODER_DIM", 256),
         batch_size=16, num_workers=2, mixed_precision=True,
     )
 
